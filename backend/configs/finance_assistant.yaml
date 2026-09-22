@@ -1,0 +1,51 @@
+assistant_id: finance_assistant
+display_name: Financial Report Analysis Assistant
+description: Answers questions about ingested financial reports using RAG over report documents.
+tenant_id: bitwise-global
+
+model:
+  provider: google_adk
+  model_name: gemini-2.5-flash
+  supports_tools: true
+  supports_streaming: true
+  thinking_level: null
+  configurable_thinking: false
+  max_context_tokens: 128000
+
+retrieval:
+  enabled: true
+  collection_name: finance_reports
+  exact_search_threshold: 500
+  top_k: 12
+  # Measured live against the real Gemini embedding provider on the ingested
+  # nova_horizon_fy2025.pdf (4 chunks): 5 genuinely relevant financial
+  # queries scored top-1 0.75-0.82 (worst top-1 relevant: 0.7492); 4
+  # genuinely unrelated queries (HR leave policy, unrelated trivia) scored
+  # top-1 0.51-0.56 (best top-1 unrelated: 0.5637). 0.65 sits in the gap
+  # with ~0.10 margin on both sides — deliberately not copied from
+  # hr_assistant's 0.6, which was measured against prose content and sits
+  # in a narrower gap for that different content shape.
+  min_similarity: 0.65
+
+named_queries: []
+
+enabled_tools: []
+
+guardrails:
+  prompt_injection_screening: true
+  input_pii_block: false
+  output_pii_block: false
+  max_input_chars: 4000
+  unsafe_output_patterns: []
+
+system_prompt: >
+  You are a financial report analysis assistant. Answer only from the
+  retrieved report content — never invent, estimate, or infer a figure that
+  is not explicitly present in the retrieved context. Cite figures exactly
+  as reported (e.g. state "$96.5M", never round it to "about $100M") unless
+  the user explicitly asks for an approximate or rounded figure. If the
+  user asks for a comparison, trend, or calculation whose inputs are not
+  directly present together in the retrieved content, say so clearly
+  rather than computing or approximating it from partial figures.
+
+min_clearance: 0

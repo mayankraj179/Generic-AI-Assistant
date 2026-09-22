@@ -1,0 +1,65 @@
+[project]
+name = "generic-ai-assistant-framework"
+version = "0.1.0"
+description = "Generic, config-driven AI assistant framework core"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+    "pyjwt[crypto]>=2.10.1",
+    "pyyaml>=6.0.2",
+    "sqlalchemy>=2.0.35",
+    "asyncpg>=0.29.0",
+    "pgvector>=0.3.5",
+    "redis>=5.1.0",
+    "alembic>=1.13.3",
+    "google-adk>=1.0.0",
+    "google-genai>=1.0.0",
+    "pypdf>=5.0.0",
+    "python-docx>=1.1.0",
+    "openpyxl>=3.1.0",
+]
+
+[tool.setuptools]
+packages = [
+    "app",
+    "app.api",
+    "app.auth",
+    "app.config",
+    "app.core",
+    "app.db",
+    "app.guardrails",
+    "app.ingestion",
+    "app.orchestration",
+    "app.services",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.3",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.2",
+    "ruff>=0.6.9",
+    "mypy>=1.11.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

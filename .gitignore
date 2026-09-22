@@ -1,0 +1,23 @@
+﻿# Secrets — never commit
+backend/.env
+
+# Python
+backend/.venv/
+**/__pycache__/
+*.pyc
+backend/.mypy_cache/
+backend/.pytest_cache/
+backend/.ruff_cache/
+*.egg-info/
+
+# Logs and scratch test scripts
+backend/*.log
+backend/scratch_*.py
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db

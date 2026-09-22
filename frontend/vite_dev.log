@@ -1,0 +1,27 @@
+
+> assistant-widget@0.1.0 dev
+> vite --port 5173
+
+
+  [32m[1mVITE[22m v5.4.21[39m  [2mready in [0m[1m1852[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m5173[22m/[39m
+[2m  [32m➜[39m  [1mNetwork[22m[2m: use [22m[1m--host[22m[2m to expose[22m
+[2m1:33:24 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m1:33:45 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m1:34:05 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m1:34:15 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:44:07 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:44:11 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:44:15 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:44:18 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:44:30 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:44:33 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:44:36 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:45:44 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:46:00 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m4:46:05 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/AssistantWidgetApp.tsx[22m
+[2m5:52:38 pm[22m [36m[1m[vite][22m[39m [32m✨ new dependencies optimized: [33mrecharts[32m[39m
+[2m5:52:38 pm[22m [36m[1m[vite][22m[39m [32m✨ optimized dependencies changed. reloading[39m
+[2m6:01:44 pm[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2mchat.html[22m
+[2m6:01:47 pm[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2mindex.html[22m

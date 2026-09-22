@@ -1,0 +1,42 @@
+assistant_id: hr_assistant
+display_name: HR Policy Assistant
+description: Answers employee questions about HR policy using RAG over policy documents.
+tenant_id: bitwise-global
+
+model:
+  provider: google_adk
+  model_name: gemini-2.5-flash
+  supports_tools: true
+  supports_streaming: true
+  thinking_level: null
+  configurable_thinking: false
+  max_context_tokens: 128000
+
+retrieval:
+  enabled: true
+  collection_name: hr_policy_docs
+  exact_search_threshold: 500
+  top_k: 8
+  min_similarity: 0.6
+
+named_queries:
+  - name: employee_leave_balance
+    description: Looks up the current leave balance for the requesting employee.
+    sql_template: "SELECT balance_days FROM leave_balances WHERE employee_id = :principal_id"
+    required_labels:
+      - "role:employee"
+
+enabled_tools: []
+
+guardrails:
+  prompt_injection_screening: true
+  input_pii_block: false
+  output_pii_block: false
+  max_input_chars: 4000
+  unsafe_output_patterns: []
+
+system_prompt: >
+  You are an HR policy assistant. Answer only from retrieved policy content
+  and named-query results. Never invent policy details.
+
+min_clearance: 0
