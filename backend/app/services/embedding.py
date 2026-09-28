@@ -27,9 +27,16 @@ class EmbeddingProvider(Protocol):
     "search intent" (queries) via a task-type distinction the model itself
     requires. embed_documents() is the batch form used during ingestion,
     where the underlying SDK supports embedding many chunks in one call.
+
+    ``model_id`` names the vector space this provider embeds into (e.g.
+    "gemini:gemini-embedding-001"). It is stored on every chunk at ingestion
+    and filtered on at search, so a query is only ever compared against
+    chunks embedded by the same model — vectors from different models are
+    meaningless to compare, even when their dimensions happen to match.
     """
 
     dim: int
+    model_id: str
 
     async def embed_document(self, text: str) -> list[float]: ...
 
@@ -54,6 +61,7 @@ class HashEmbeddingProvider:
         if dim <= 0:
             raise ValueError("embedding dimension must be positive")
         self.dim = dim
+        self.model_id = f"hash:{dim}"
 
     async def embed_document(self, text: str) -> list[float]:
         return self._embed(text)

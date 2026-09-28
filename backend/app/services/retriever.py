@@ -19,13 +19,23 @@ class RetrievalService:
         assistant_id: str,
         top_k: int = 5,
         min_similarity: float = 0.0,
+        embedder: EmbeddingProvider | None = None,
     ) -> list[Chunk]:
         if principal.is_zero_label:
             return []
 
-        query_embedding = await self.embedder.embed_query(query)
+        # Per-call override lets ChatOrchestrator resolve the calling
+        # assistant's own configured embedding provider (see
+        # app/services/embedding_provider_factory.py) instead of always
+        # using this service's construction-time default — the query must
+        # be embedded with the same provider that embedded that assistant's
+        # documents, since different providers/models are not guaranteed to
+        # share a vector space.
+        active_embedder = embedder or self.embedder
+        query_embedding = await active_embedder.embed_query(query)
         chunks = await self.vector_store.search(
             query_embedding=query_embedding,
+            embedding_model=active_embedder.model_id,
             tenant_id=principal.tenant_id,
             assistant_id=assistant_id,
             principal_labels=principal.labels,

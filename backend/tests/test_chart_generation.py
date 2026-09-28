@@ -91,7 +91,9 @@ class FakeRetrievalService:
         self.chunks_to_return = chunks_to_return or []
         self.calls: list[dict] = []
 
-    async def search(self, *, query, principal, assistant_id, top_k, min_similarity=0.0):
+    async def search(
+        self, *, query, principal, assistant_id, top_k, min_similarity=0.0, embedder=None
+    ):
         self.calls.append({"query": query, "principal": principal})
         return self.chunks_to_return
 

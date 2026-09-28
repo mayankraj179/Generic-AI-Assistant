@@ -185,12 +185,15 @@ class _FakeVectorStoreForThreshold:
     def __init__(self, chunks: list[Chunk]) -> None:
         self._chunks = chunks
 
-    async def search(self, *, query_embedding, tenant_id, assistant_id, principal_labels, top_k):
+    async def search(
+        self, *, query_embedding, embedding_model, tenant_id, assistant_id, principal_labels, top_k
+    ):
         return self._chunks
 
 
 class _FakeEmbedderForThreshold:
     dim = 3072
+    model_id = "fake:threshold"
 
     async def embed_query(self, text: str) -> list[float]:
         return [0.0] * self.dim

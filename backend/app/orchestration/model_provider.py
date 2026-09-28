@@ -89,6 +89,33 @@ class GroundedPrompt:
     chart/graph AND retrieval actually produced authorized chunks. A
     provider must skip chart generation entirely when this is False, so
     ordinary turns pay zero extra latency/cost for this feature."""
+    enabled_tools: tuple[str, ...] = ()
+    """Tool names (keys into app.tools.builtin.TOOL_REGISTRY) this turn's
+    assistant config has opted into via AssistantConfig.enabled_tools —
+    empty by default, so an ordinary turn for an assistant with no tools
+    configured pays zero extra cost, the same discipline chart_requested
+    already established. A provider resolves these names against the
+    shared registry itself; this stays a plain tuple of strings rather than
+    ToolDefinition objects so GroundedPrompt doesn't have to import the
+    tools package.
+
+    The tool-call loop itself (propose -> execute -> feed result back ->
+    repeat, bounded by max_tool_calls) lives inside each provider, not in
+    ChatOrchestrator: Gemini/ADK and OpenRouter each have a genuinely
+    different native mechanism for this (google-adk's Runner executes
+    FunctionTool calls internally; OpenRouter's raw HTTP API requires a
+    hand-written request/response loop — see GeminiProvider/
+    OpenRouterProvider), and ChatOrchestrator only ever sees the single
+    final ModelReply either way, exactly like it already does for the
+    text/grounded/chart fields. This keeps the Protocol's one-call-per-turn
+    shape intact instead of inventing a new cross-provider intermediate
+    "tool call" event type."""
+    max_tool_calls: int = 4
+    """Hard cap on tool-call round-trips a provider may make while
+    producing this turn's reply (from AssistantConfig.max_tool_calls) —
+    never unbounded, even for read-only tools. A provider that hits this
+    cap without reaching a final answer must return a clear, honest reply
+    saying so, never a truncated or fabricated one."""
 
 
 @dataclass(frozen=True)

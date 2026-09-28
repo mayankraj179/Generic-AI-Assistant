@@ -39,6 +39,7 @@ class IngestionService:
         tenant_id: str,
         assistant_id: str,
         access_labels: frozenset[str] | None = None,
+        embedder: EmbeddingProvider | None = None,
     ) -> list[Chunk]:
         """Ingests one file. Raises FileNotFoundError/ParseError directly —
         a single explicit ingest_file() call should fail loudly, unlike
@@ -57,7 +58,11 @@ class IngestionService:
         """
         discovered = DiscoveredSource(uri=source_uri, source_type="filesystem")
         return await self._ingest_source(
-            discovered, tenant_id=tenant_id, assistant_id=assistant_id, access_labels=access_labels
+            discovered,
+            tenant_id=tenant_id,
+            assistant_id=assistant_id,
+            access_labels=access_labels,
+            embedder=embedder,
         )
 
     async def ingest_directory(
@@ -66,6 +71,7 @@ class IngestionService:
         source_root: str,
         tenant_id: str,
         assistant_id: str,
+        embedder: EmbeddingProvider | None = None,
     ) -> list[Chunk]:
         """Ingests every supported file under source_root. Unlike
         ingest_file(), a single bad file here is logged and skipped rather
@@ -76,7 +82,7 @@ class IngestionService:
         for discovered in discover(source_root):
             try:
                 chunks = await self._ingest_source(
-                    discovered, tenant_id=tenant_id, assistant_id=assistant_id
+                    discovered, tenant_id=tenant_id, assistant_id=assistant_id, embedder=embedder
                 )
             except (ParseError, FileNotFoundError):
                 logger.exception("skipping file that failed to ingest: %s", discovered.uri)
@@ -94,6 +100,7 @@ class IngestionService:
         tenant_id: str,
         assistant_id: str,
         access_labels: frozenset[str] | None = None,
+        embedder: EmbeddingProvider | None = None,
     ) -> list[Chunk]:
         with_access = (
             capture_access(discovered)
@@ -103,12 +110,21 @@ class IngestionService:
 
         parsed = parse(with_access)
 
+        active_embedder = embedder or self.embedder
         existing = await self.vector_store.get_document_fingerprint(
             tenant_id=tenant_id, assistant_id=assistant_id, source_uri=discovered.uri
         )
-        if existing is not None and existing == (parsed.content_hash, with_access.access_labels):
+        # The embedding model is part of the fingerprint: stored chunks from a
+        # different model are invisible to search (see PgVectorStore.search),
+        # so an otherwise-unchanged document must be re-embedded, not skipped.
+        if existing is not None and existing == (
+            parsed.content_hash,
+            with_access.access_labels,
+            active_embedder.model_id,
+        ):
             logger.info(
-                "ingestion skipped (content and access labels unchanged): %s", discovered.uri
+                "ingestion skipped (content, access labels and embedding model unchanged): %s",
+                discovered.uri,
             )
             return []
 
@@ -117,7 +133,9 @@ class IngestionService:
             logger.info("ingestion produced no chunks (empty document): %s", discovered.uri)
             return []
 
-        embeddings = await self.embedder.embed_documents([item.embedded_text for item in chunked])
+        embeddings = await active_embedder.embed_documents(
+            [item.embedded_text for item in chunked]
+        )
         await self.vector_store.store_document(
             tenant_id=tenant_id,
             assistant_id=assistant_id,
@@ -127,6 +145,7 @@ class IngestionService:
             content_hash=parsed.content_hash,
             chunks=chunked,
             embeddings=embeddings,
+            embedding_model=active_embedder.model_id,
         )
         action = "created new document" if existing is None else "replaced generation for"
         logger.info("ingestion %s: %s (%d chunks)", action, discovered.uri, len(chunked))

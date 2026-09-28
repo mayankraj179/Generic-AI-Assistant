@@ -18,6 +18,9 @@ retrieval:
   exact_search_threshold: 500
   top_k: 8
   min_similarity: 0.6
+  # Explicit rather than relying on RetrievalConfig's default, so this
+  # assistant can never be moved off Gemini as a side effect of a default change.
+  embedding_provider: gemini
 
 named_queries:
   - name: employee_leave_balance

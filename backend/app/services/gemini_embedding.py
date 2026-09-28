@@ -55,6 +55,7 @@ class GeminiEmbeddingProvider:
         self._api_key = api_key
         self._model_name = model_name
         self.dim = dim
+        self.model_id = f"gemini:{model_name}"
 
     async def embed_document(self, text: str) -> list[float]:
         return (await self._embed([text], task_type=_TASK_TYPE_DOCUMENT))[0]

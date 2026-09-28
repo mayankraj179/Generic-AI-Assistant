@@ -13,6 +13,30 @@ python -m uvicorn app.main:app --reload
 
 Requires: `fastapi`, `pydantic`, `pyyaml`, `pytest`, and the JWT/OIDC validation stack.
 
+### Known environment quirk: port 8000 refusing to bind on some Windows setups
+
+On at least one Windows dev machine, `uvicorn ... --port 8000` failed immediately with
+`WinError 10013` ("An attempt was made to access a socket in a way forbidden by its access
+permissions") — not a normal "port already in use" error. Investigated and ruled out:
+
+- A stale process holding the port (`netstat -ano` showed nothing on 8000).
+- Windows' reserved/excluded port range (`netsh interface ipv4 show excludedportrange
+  protocol=tcp` didn't include 8000).
+- A named Windows Firewall rule targeting port 8000 specifically.
+- A Docker container (this project's or otherwise) publishing 8000.
+
+None of the above reproduced the failure in a separate shell session on the same machine —
+`uvicorn --port 8000` bound successfully there. That points at something scoped to the
+specific interactive session/process that hit it (a security product doing per-process
+socket filtering, a VPN client, or similar), not a persistent, generally-reproducible cause —
+not something this repo can detect or fix. **If you hit this**: run the backend on a
+different port instead, e.g. `python -m uvicorn app.main:app --reload --port 8001`, and
+point the frontend dev harness's "API base URL" field (`frontend/chat.html`) at
+`http://localhost:8001` to match. If the wrong port ends up in that field, `postChat`/
+`postChatStream` now report it by name (`Could not reach http://localhost:8000 — check the
+API base URL and confirm the backend is running there.`) instead of a generic "is it
+running?" message, so a base-URL mismatch is visible directly in the error text.
+
 ### Authentication architecture
 
 ```

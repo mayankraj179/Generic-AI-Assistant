@@ -40,6 +40,14 @@ def test_load_all_configs_from_directory():
     assert "hr_assistant" in configs
 
 
+def test_only_gemini_assistants_are_active():
+    # configs/examples/ is not scanned (non-recursive glob), so the parked
+    # OpenRouter example must not be loaded as a live assistant.
+    configs = load_all_assistant_configs(CONFIGS_DIR)
+    assert set(configs) == {"hr_assistant", "finance_assistant"}
+    assert all(c.model.provider == "google_adk" for c in configs.values())
+
+
 def test_duplicate_assistant_id_raises(tmp_path):
     (tmp_path / "a.yaml").write_text(
         _minimal_config_yaml("dup_id"), encoding="utf-8"
@@ -62,3 +70,25 @@ model:
   model_name: gpt-4.1
 system_prompt: You are a test assistant.
 """
+
+
+@pytest.mark.parametrize("assistant_id", ["hr_assistant", "finance_assistant"])
+def test_gemini_assistants_stay_fully_on_gemini(assistant_id):
+    # Guards against these long-verified assistants being moved to another
+    # provider as a side effect of unrelated work (e.g. a missing API key).
+    config = load_assistant_config(CONFIGS_DIR / f"{assistant_id}.yaml")
+    assert config.model.provider == "google_adk"
+    assert config.model.model_name == "gemini-2.5-flash"
+    assert config.retrieval is not None
+    assert config.retrieval.embedding_provider == "gemini"
+    assert config.retrieval.embedding_model is None
+
+
+def test_parked_openrouter_example_is_fully_on_openrouter():
+    config = load_assistant_config(CONFIGS_DIR / "examples" / "finance_assistant_openrouter.yaml")
+    assert config.model.provider == "openrouter"
+    assert config.model.model_name == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert config.retrieval is not None
+    assert config.retrieval.embedding_provider == "openrouter"
+    assert config.retrieval.embedding_model == "nvidia/nemotron-3-embed-1b:free"
+    assert "experiment" in config.display_name.lower()

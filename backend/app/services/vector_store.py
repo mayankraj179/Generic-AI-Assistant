@@ -19,16 +19,21 @@ class PgVectorStore:
 
     async def get_document_fingerprint(
         self, *, tenant_id: str, assistant_id: str, source_uri: str
-    ) -> tuple[str, frozenset[str]] | None:
+    ) -> tuple[str, frozenset[str], str] | None:
         """Lightweight read-only lookup used by IngestionService to decide
         whether re-ingesting a source is a no-op, without doing any
-        embedding work first. Returns ``(content_hash, access_labels)`` for
-        the existing DocumentRecord at this source_uri, or ``None`` if
-        nothing has ever been ingested from it. Never mutates anything.
+        embedding work first. Returns ``(content_hash, access_labels,
+        embedding_model)`` for the existing DocumentRecord at this
+        source_uri, or ``None`` if nothing has ever been ingested from it.
+        Never mutates anything.
         """
         async with self._session_factory() as session:
             result = await session.execute(
-                select(DocumentRecord.content_hash, DocumentRecord.access_labels).where(
+                select(
+                    DocumentRecord.content_hash,
+                    DocumentRecord.access_labels,
+                    DocumentRecord.embedding_model,
+                ).where(
                     DocumentRecord.tenant_id == tenant_id,
                     DocumentRecord.assistant_id == assistant_id,
                     DocumentRecord.source_uri == source_uri,
@@ -37,8 +42,8 @@ class PgVectorStore:
             row = result.first()
             if row is None:
                 return None
-            content_hash, access_labels = row
-            return content_hash, frozenset(access_labels or [])
+            content_hash, access_labels, embedding_model = row
+            return content_hash, frozenset(access_labels or []), embedding_model
 
     async def store_document(
         self,
@@ -51,6 +56,7 @@ class PgVectorStore:
         content_hash: str,
         chunks: Sequence[Chunk],
         embeddings: Sequence[list[float]],
+        embedding_model: str,
     ) -> DocumentRecord:
         """Insert-or-atomically-replace: always the caller's job to have
         already decided this call is actually needed (IngestionService skips
@@ -94,6 +100,7 @@ class PgVectorStore:
                     title=title,
                     access_labels=sorted_labels,
                     content_hash=content_hash,
+                    embedding_model=embedding_model,
                     acl_version=1,
                 )
                 session.add(document)
@@ -114,6 +121,7 @@ class PgVectorStore:
                 document.title = title
                 document.access_labels = sorted_labels
                 document.content_hash = content_hash
+                document.embedding_model = embedding_model
                 document.acl_version = (document.acl_version or 1) + 1
 
             generation_id = uuid.uuid4()
@@ -126,6 +134,7 @@ class PgVectorStore:
                     display_text=chunk_item.display_text,
                     embedded_text=chunk_item.embedded_text,
                     embedding=embeddings[index],
+                    embedding_model=embedding_model,
                     access_labels=list(sorted(chunk_item.access_labels)),
                     acl_version=document.acl_version,
                     generation_id=generation_id,
@@ -153,6 +162,7 @@ class PgVectorStore:
         self,
         *,
         query_embedding: list[float],
+        embedding_model: str,
         tenant_id: str,
         assistant_id: str,
         principal_labels: frozenset[str],
@@ -179,6 +189,11 @@ class PgVectorStore:
                     ChunkRecord.tenant_id == tenant_id,
                     ChunkRecord.assistant_id == assistant_id,
                     ChunkRecord.is_current.is_(True),
+                    # Only chunks in the query's own vector space — see
+                    # ChunkRecord.embedding. Chunks left over from an
+                    # assistant's previous embedding model are invisible
+                    # until re-ingested, rather than scored meaninglessly.
+                    ChunkRecord.embedding_model == embedding_model,
                     ChunkRecord.access_labels.op("&&")(list(sorted(principal_labels))),
                 )
                 .order_by(distance)

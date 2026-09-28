@@ -45,6 +45,7 @@ from app.orchestration.errors import (
 from app.orchestration.model_provider import ChartSpec, ModelProviderError
 from app.services.conversation_store import ConversationNotFoundError, ConversationStore
 from app.services.embedding import EmbeddingProviderError
+from app.services.embedding_provider_factory import get_embedding_provider
 from app.services.ingestion_service import IngestionService
 
 logger = logging.getLogger(__name__)
@@ -352,13 +353,15 @@ async def admin_ingest(
 ) -> AdminIngestResponse:
     del principal
     configs = load_all_assistant_configs(CONFIGS_DIR)
-    if request.assistant_id not in configs:
+    config = configs.get(request.assistant_id)
+    if config is None:
         raise HTTPException(
             status_code=404,
             detail=f"unknown assistant_id '{request.assistant_id}'",
         )
 
     access_labels = frozenset(request.access_labels) if request.access_labels else None
+    embedder = get_embedding_provider(config=config, settings=settings)
 
     try:
         chunks = await ingestion_service.ingest_file(
@@ -366,6 +369,7 @@ async def admin_ingest(
             tenant_id=request.tenant_id,
             assistant_id=request.assistant_id,
             access_labels=access_labels,
+            embedder=embedder,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from None

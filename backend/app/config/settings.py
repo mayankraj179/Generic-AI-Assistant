@@ -60,6 +60,13 @@ class Settings(BaseSettings):
             "gemini_api_key",
         ),
     )
+    openrouter_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "OPENROUTER_API_KEY",
+            "openrouter_api_key",
+        ),
+    )
 
     @field_validator("development_permission_set", mode="before")
     @classmethod

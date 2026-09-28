@@ -1,0 +1,83 @@
+assistant_id: finance_assistant_openrouter
+display_name: Financial Report Analysis Assistant (OpenRouter free-tier experiment)
+description: EXPERIMENTAL / FALLBACK PATH — the one assistant that runs entirely on free OpenRouter models (chat and embeddings), over the same Nova Horizon report as finance_assistant. finance_assistant and hr_assistant stay on Gemini. No chart generation on this path.
+tenant_id: bitwise-global
+
+model:
+  provider: openrouter
+  # Free model. Was nex-agi/nex-n2.5-mini:free until that slug disappeared
+  # from the OpenRouter catalog. Chosen 2026-09-27 and re-verified live
+  # the same day (still listed, pricing 0/0, answering). Among the :free
+  # candidates with tool support it was fastest and reliable for both plain
+  # and tool-calling requests. Rejected: google/gemma-4-31b-it:free (429
+  # upstream rate limit), qwen/qwen3.8-27b:free (intermittent 429),
+  # thinkingmachines/inkling:free (403, "agentic harnesses only"),
+  # nvidia/nemotron-3-ultra-550b-a55b:free (7.5s tool calls), openrouter/free
+  # (routes to a different model on every call). It is a reasoning model, so
+  # a tiny max_tokens can be consumed entirely by reasoning; OpenRouterProvider's
+  # 2048 cap is comfortably enough. Free-tier slugs vanish without notice —
+  # re-probe the catalog if this starts returning 404/429.
+  model_name: nvidia/nemotron-3-super-120b-a12b:free
+  supports_tools: true
+  supports_streaming: true
+  thinking_level: null
+  configurable_thinking: false
+  max_context_tokens: 128000
+
+retrieval:
+  enabled: true
+  collection_name: finance_reports
+  exact_search_threshold: 500
+  top_k: 12
+  # Re-measured 2026-09-27 against this assistant's own re-ingested
+  # nemotron-3-embed-1b chunks of nova_horizon_fy2025.pdf, using the same
+  # methodology and the same 5 relevant + 4 unrelated queries as
+  # finance_assistant.yaml's Gemini measurement (the 0.65 inherited from there
+  # would reject every chunk; this model's scores sit on a different scale).
+  #   Original 9 queries: relevant top-1 0.357-0.685, unrelated -0.009-0.062.
+  #   Plus extra queries (n=22 in total): relevant as low as 0.1635 ("How much
+  #   cash does the company have?"), unrelated as high as 0.105 ("annual
+  #   leave days").
+  # Unrelated queries cluster tightly near 0, well apart from relevant ones.
+  # The worst-case gap (0.058) comes from short questions about table
+  # figures, which this model scores low (0.16-0.23). 0.13 sits mid-gap. The
+  # expected failure is fail-closed: a vaguely-phrased relevant question
+  # falls under the bar and gets the "not enough information" reply. It is
+  # not an unrelated question being wrongly grounded. Re-measure with real
+  # reports before relying on this.
+  min_similarity: 0.13
+  # Free OpenRouter embedding model (2048-dim), selected via embedding_model.
+  # Its chunks live in the shared chunks table under their own
+  # embedding_model tag (alembic 0005), alongside the Gemini assistants'
+  # 3072-dim chunks. Needs only OPENROUTER_API_KEY.
+  embedding_provider: openrouter
+  embedding_model: nvidia/nemotron-3-embed-1b:free
+
+named_queries: []
+
+# Same read-only tools as finance_assistant.yaml, added here deliberately
+# to demonstrate OpenRouterProvider's tool-calling path (not just
+# GeminiProvider's) live — nvidia/nemotron-3-super-120b-a12b:free declares "tools" and
+# "tool_choice" in its supported_parameters (confirmed live via
+# GET /api/v1/models), so this is a genuine, not just theoretical, test of
+# OpenRouter's OpenAI-shape function-calling support.
+enabled_tools: [current_datetime, calculate]
+
+guardrails:
+  prompt_injection_screening: true
+  input_pii_block: false
+  output_pii_block: false
+  max_input_chars: 4000
+  unsafe_output_patterns: []
+
+system_prompt: >
+  You are a financial report analysis assistant. Answer only from the
+  retrieved report content — never invent, estimate, or infer a figure that
+  is not explicitly present in the retrieved context. Cite figures exactly
+  as reported (e.g. state "$96.5M", never round it to "about $100M") unless
+  the user explicitly asks for an approximate or rounded figure. If the
+  user asks for a comparison, trend, or calculation whose inputs are not
+  directly present together in the retrieved content, say so clearly
+  rather than computing or approximating it from partial figures.
+
+min_clearance: 0

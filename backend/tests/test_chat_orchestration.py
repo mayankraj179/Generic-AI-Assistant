@@ -58,6 +58,7 @@ def _make_config(
     retrieval_enabled: bool = True,
     min_similarity: float = 0.6,
     guardrails: GuardrailsConfig | None = None,
+    enabled_tools: list[str] | None = None,
 ) -> AssistantConfig:
     return AssistantConfig(
         assistant_id="hr_assistant",
@@ -74,6 +75,7 @@ def _make_config(
         guardrails=guardrails or GuardrailsConfig(),
         system_prompt="You are an HR policy assistant. Answer only from retrieved content.",
         min_clearance=min_clearance,
+        enabled_tools=enabled_tools or [],
     )
 
 
@@ -98,7 +100,9 @@ class FakeRetrievalService:
         self.raise_error = raise_error
         self.calls: list[dict] = []
 
-    async def search(self, *, query, principal, assistant_id, top_k, min_similarity=0.0):
+    async def search(
+        self, *, query, principal, assistant_id, top_k, min_similarity=0.0, embedder=None
+    ):
         self.calls.append(
             {
                 "query": query,
@@ -106,6 +110,7 @@ class FakeRetrievalService:
                 "assistant_id": assistant_id,
                 "top_k": top_k,
                 "min_similarity": min_similarity,
+                "embedder": embedder,
             }
         )
         if self.raise_error:
@@ -311,6 +316,11 @@ async def test_retrieved_context_is_passed_to_model_layer_and_cited():
 
 @pytest.mark.asyncio
 async def test_no_authorized_context_returns_safe_reply_without_calling_model():
+    # REGRESSION GUARD for the zero-chunks-but-tools gate change (see
+    # test_tool_calling_orchestration.py): _make_config() here has
+    # enabled_tools=[] by default (hr_assistant has none configured), so
+    # this must still hit the hard safe-refusal gate exactly as before —
+    # the model must never be called.
     retrieval = FakeRetrievalService([])  # nothing authorized/found
     provider = FakeModelProvider()
     orchestrator = _make_orchestrator(retrieval=retrieval, provider=provider)
@@ -323,6 +333,27 @@ async def test_no_authorized_context_returns_safe_reply_without_calling_model():
     assert result.citations == ()
     assert result.grounded is False
     assert provider.calls == []  # the model must never be called without grounding
+
+
+@pytest.mark.asyncio
+async def test_no_chunks_but_tools_enabled_calls_the_model_not_the_refusal():
+    """The gate now only refuses outright when there's neither relevant
+    document content NOR any tools configured — see
+    ChatOrchestrator._prepare_turn and test_tool_calling_orchestration.py
+    for the full coverage of this behavior. This is a lighter smoke test
+    confirming the same wiring holds from this file's own fixtures."""
+    retrieval = FakeRetrievalService([])
+    provider = FakeModelProvider(reply_text="It's currently 2026-09-24.")
+    orchestrator = _make_orchestrator(retrieval=retrieval, provider=provider)
+    config = _make_config(enabled_tools=["current_datetime"])
+
+    result = await orchestrator.handle(
+        principal=_principal(), config=config, message="what's today's date"
+    )
+
+    assert provider.calls  # the model WAS called, unlike the hard-gate path
+    assert result.text == "It's currently 2026-09-24."
+    assert result.text != NO_AUTHORIZED_CONTEXT_REPLY
 
 
 @pytest.mark.asyncio

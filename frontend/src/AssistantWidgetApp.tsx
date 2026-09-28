@@ -14,7 +14,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { type Chart, type Citation, postChatStream } from "./api";
+import { type Chart, type Citation, getAssistants, postChatStream } from "./api";
 
 interface AssistantWidgetAppProps {
   assistantId: string;
@@ -171,6 +171,16 @@ export function AssistantWidgetApp({ assistantId, apiBase, authToken }: Assistan
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const finalizeTimerRef = useRef<number | undefined>(undefined);
 
+  // "unknown" covers both "still checking" and "the validation call itself
+  // failed" (network/auth issue) — in both cases the widget proceeds as
+  // before rather than blocking on a check that couldn't complete. Only a
+  // definite "invalid" (assistant-id not in the returned list) blocks
+  // sending — an assistant-id that DOES exist but wasn't the one the caller
+  // meant to type can't be caught this way; see the header label instead.
+  const [assistantValidation, setAssistantValidation] = useState<
+    { status: "unknown" } | { status: "valid" } | { status: "invalid"; availableIds: string[] }
+  >({ status: "unknown" });
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ block: "end" });
   }, [messages]);
@@ -185,9 +195,37 @@ export function AssistantWidgetApp({ assistantId, apiBase, authToken }: Assistan
 
   const isMisconfigured = !apiBase || !authToken;
 
+  useEffect(() => {
+    if (isMisconfigured) {
+      return;
+    }
+    let cancelled = false;
+    getAssistants(apiBase, authToken)
+      .then((assistants) => {
+        if (cancelled) {
+          return;
+        }
+        const availableIds = assistants.map((a) => a.assistantId);
+        setAssistantValidation(
+          availableIds.includes(assistantId)
+            ? { status: "valid" }
+            : { status: "invalid", availableIds },
+        );
+      })
+      .catch(() => {
+        // The check itself failed (network/auth/etc.) — leave validation as
+        // "unknown" rather than falsely reporting "invalid"; the ordinary
+        // send-message error handling will surface the real problem once
+        // the user actually tries to send.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiBase, authToken, assistantId, isMisconfigured]);
+
   async function handleSend(): Promise<void> {
     const text = input.trim();
-    if (!text || isSending || isMisconfigured) {
+    if (!text || isSending || isMisconfigured || assistantValidation.status === "invalid") {
       return;
     }
 
@@ -290,7 +328,11 @@ export function AssistantWidgetApp({ assistantId, apiBase, authToken }: Assistan
       <style>{STYLES}</style>
       <header className="aw-header">
         <div className="aw-dot" />
-        <strong>{assistantId || "(no assistant-id set)"}</strong>
+        {/* Always the literal assistant-id attribute value, never a
+         * display name or anything else — the header is the at-a-glance
+         * way to catch "I typed the wrong assistant-id" during manual
+         * testing, so it must be unambiguous about what it's showing. */}
+        <strong>Assistant: {assistantId || "(no assistant-id set)"}</strong>
       </header>
 
       {isMisconfigured ? (
@@ -298,6 +340,15 @@ export function AssistantWidgetApp({ assistantId, apiBase, authToken }: Assistan
           This widget is missing required configuration: both{" "}
           <code>api-base</code> and <code>auth-token</code> attributes must be set on{" "}
           <code>&lt;assistant-widget&gt;</code>.
+        </div>
+      ) : assistantValidation.status === "invalid" ? (
+        <div className="aw-config-error">
+          Assistant &quot;{assistantId}&quot; not found
+          {assistantValidation.availableIds.length > 0 ? (
+            <> — available: {assistantValidation.availableIds.join(", ")}</>
+          ) : (
+            <> — the backend has no assistant configs loaded.</>
+          )}
         </div>
       ) : (
         <>

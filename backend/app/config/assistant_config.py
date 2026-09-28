@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.tools.builtin import TOOL_REGISTRY
+
 # Deterministic, keyword/pattern-based chart-intent gate (see
 # ChatOrchestrator._message_requests_chart) — deliberately not a model call
 # or classifier. Regex, case-insensitive. Per-assistant tunable via
@@ -52,6 +54,20 @@ class RetrievalConfig(BaseModel):
     exact_search_threshold: int = 500  # below this accessible-set size, use exact search
     top_k: int = 8
     min_similarity: float = 0.6
+    # Which EmbeddingProvider implementation embeds both this assistant's
+    # documents (at ingestion) and its queries (at retrieval) — see
+    # app/services/embedding_provider_factory.py for the resolved set.
+    # "gemini" (the default) preserves the exact pre-existing behavior for
+    # every assistant that doesn't set this; "openrouter" routes through
+    # OpenRouterEmbeddingProvider instead, requiring only OPENROUTER_API_KEY.
+    embedding_provider: str = "gemini"
+    # Optional model override within that provider; None means the
+    # provider's own default model. Switching models needs no schema change:
+    # chunks.embedding is dimensionless and every chunk is tagged with the
+    # model that embedded it (alembic 0005). Re-ingest after changing it —
+    # search only matches chunks tagged with the assistant's current model.
+    # min_similarity must be re-measured too; score scales differ by model.
+    embedding_model: str | None = None
 
 
 class NamedQuery(BaseModel):
@@ -101,6 +117,11 @@ class AssistantConfig(BaseModel):
     retrieval: RetrievalConfig | None = None
     named_queries: list[NamedQuery] = Field(default_factory=list)
     enabled_tools: list[str] = Field(default_factory=list)
+    # Hard cap on tool-call round-trips a provider may make while producing
+    # one turn's reply — see GroundedPrompt.max_tool_calls
+    # (app/orchestration/model_provider.py). Never unbounded, even for
+    # read-only tools like these.
+    max_tool_calls: int = Field(default=4, gt=0)
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
 
     system_prompt: str
@@ -123,4 +144,10 @@ class AssistantConfig(BaseModel):
     def _no_duplicate_tools(cls, v: list[str]) -> list[str]:
         if len(v) != len(set(v)):
             raise ValueError("enabled_tools contains duplicates")
+        unknown = sorted(name for name in v if name not in TOOL_REGISTRY)
+        if unknown:
+            raise ValueError(
+                f"enabled_tools contains unknown tool name(s): {', '.join(unknown)} "
+                f"(known tools: {', '.join(sorted(TOOL_REGISTRY))})"
+            )
         return v

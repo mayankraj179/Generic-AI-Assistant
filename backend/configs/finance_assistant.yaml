@@ -26,10 +26,19 @@ retrieval:
   # hr_assistant's 0.6, which was measured against prose content and sits
   # in a narrower gap for that different content shape.
   min_similarity: 0.65
+  # Explicit rather than relying on RetrievalConfig's default, so this
+  # assistant can never be moved off Gemini as a side effect of a default change.
+  embedding_provider: gemini
 
 named_queries: []
 
-enabled_tools: []
+# Read-only utility tools (app/tools/builtin.py) — no external dependencies,
+# no side effects, no confirmation gate. "How many days until FY2026" /
+# "what's the gross margin delta, computed precisely" are natural questions
+# for this assistant, and giving the model calculate/current_datetime means
+# it computes exact answers instead of estimating them from its own
+# reasoning. max_tool_calls left at its default (4).
+enabled_tools: [current_datetime, calculate]
 
 guardrails:
   prompt_injection_screening: true

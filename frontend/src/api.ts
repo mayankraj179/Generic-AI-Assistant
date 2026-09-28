@@ -120,7 +120,22 @@ function toChart(dto: ChartDto): Chart {
   };
 }
 
-async function request<T>(url: string, token: string, init?: RequestInit): Promise<T> {
+/** Network-level failure message shared by request() and postChatStream() —
+ * fires only when fetch() itself rejects (DNS, connection refused, wrong
+ * port, CORS block), never for an HTTP error response from a reachable
+ * backend (those are handled separately, after a Response actually comes
+ * back). Includes the attempted base URL so a wrong-port/wrong-host mistake
+ * is visible in the error text itself, not just "is it running?". */
+function unreachableBackendMessage(baseUrl: string): string {
+  return `Could not reach ${baseUrl} — check the API base URL and confirm the backend is running there.`;
+}
+
+async function request<T>(
+  url: string,
+  baseUrl: string,
+  token: string,
+  init?: RequestInit,
+): Promise<T> {
   let response: Response;
   try {
     response = await fetch(url, {
@@ -132,7 +147,7 @@ async function request<T>(url: string, token: string, init?: RequestInit): Promi
       },
     });
   } catch {
-    throw new ApiError(0, "Could not reach the backend — is it running?");
+    throw new ApiError(0, unreachableBackendMessage(baseUrl));
   }
 
   if (response.status === 401 || response.status === 403) {
@@ -176,7 +191,7 @@ export async function postChat(
     body.conversation_id = params.conversationId;
   }
 
-  const data = await request<ChatResponseDto>(`${baseUrl}/chat`, token, {
+  const data = await request<ChatResponseDto>(`${baseUrl}/chat`, baseUrl, token, {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -297,7 +312,7 @@ export async function postChatStream(
       body: JSON.stringify(body),
     });
   } catch {
-    onError("Could not reach the backend — is it running?");
+    onError(unreachableBackendMessage(baseUrl));
     return;
   }
 
@@ -409,6 +424,7 @@ export async function getMessages(
 ): Promise<HistoryMessage[]> {
   const data = await request<MessageDto[]>(
     `${baseUrl}/sessions/${conversationId}/messages`,
+    baseUrl,
     token,
     { method: "GET" },
   );
@@ -419,4 +435,27 @@ export async function getMessages(
     sequenceNo: message.sequence_no,
     citations: message.citations.map(toCitation),
   }));
+}
+
+export interface AssistantSummary {
+  assistantId: string;
+  displayName: string;
+}
+
+interface AssistantSummaryDto {
+  assistant_id: string;
+  display_name: string;
+}
+
+/** GET /assistants — every assistant config currently loaded by the
+ * backend. Used by AssistantWidgetApp to validate the widget's configured
+ * assistant-id before letting the user send messages against it — an
+ * assistant-id that's misspelled or points at the wrong (but still
+ * existing) config fails silently otherwise, since /chat itself has no way
+ * to know the caller "meant" a different assistant. */
+export async function getAssistants(baseUrl: string, token: string): Promise<AssistantSummary[]> {
+  const data = await request<AssistantSummaryDto[]>(`${baseUrl}/assistants`, baseUrl, token, {
+    method: "GET",
+  });
+  return data.map((a) => ({ assistantId: a.assistant_id, displayName: a.display_name }));
 }

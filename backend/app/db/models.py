@@ -9,9 +9,10 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # gemini-embedding-001's native output dimension (verified live against the
-# installed google-genai SDK — see app/services/gemini_embedding.py). Single
-# source of truth for the vector column width; alembic/versions/0003_*.py
-# migrates the column to match.
+# installed google-genai SDK — see app/services/gemini_embedding.py), i.e. the
+# default embedder's width. Since alembic 0005 this no longer constrains the
+# chunks.embedding column, which is dimensionless; each row's vector space is
+# identified by chunks.embedding_model instead.
 EMBEDDING_DIM = 3072
 
 
@@ -33,6 +34,11 @@ class DocumentRecord(Base):
     source_uri: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
+    # model_id of the embedder behind this document's current chunk
+    # generation. Part of IngestionService's skip-if-unchanged fingerprint,
+    # so re-ingesting after an embedding-model change re-embeds instead of
+    # skipping.
+    embedding_model: Mapped[str] = mapped_column(Text, nullable=False)
     access_labels: Mapped[list[str]] = mapped_column(
         ARRAY(Text),
         nullable=False,
@@ -72,7 +78,13 @@ class ChunkRecord(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
     embedded_text: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
+    # Dimensionless on purpose (pgvector's documented approach for mixed
+    # dimensions): embedding_model says which vector space each row is in,
+    # and PgVectorStore.search only ever compares within one model. A
+    # cross-dimension comparison that slipped through would raise
+    # "different vector dimensions", never return a silently wrong score.
+    embedding: Mapped[list[float]] = mapped_column(Vector(), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(Text, nullable=False)
     access_labels: Mapped[list[str]] = mapped_column(
         ARRAY(Text),
         nullable=False,

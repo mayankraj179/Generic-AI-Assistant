@@ -6,6 +6,7 @@ from app.config.assistant_config import ModelCapabilities
 from app.config.settings import Settings
 from app.orchestration.gemini_provider import GeminiProvider
 from app.orchestration.model_provider import ModelProvider, ModelProviderError
+from app.orchestration.openrouter_provider import OpenRouterProvider
 
 _ProviderBuilder = Callable[[ModelCapabilities, Settings], ModelProvider]
 
@@ -14,9 +15,14 @@ def _build_gemini_provider(model: ModelCapabilities, settings: Settings) -> Mode
     return GeminiProvider(model_name=model.model_name, api_key=settings.gemini_api_key)
 
 
+def _build_openrouter_provider(model: ModelCapabilities, settings: Settings) -> ModelProvider:
+    return OpenRouterProvider(model_name=model.model_name, api_key=settings.openrouter_api_key)
+
+
 _PROVIDER_BUILDERS: dict[str, _ProviderBuilder] = {
     "google_adk": _build_gemini_provider,
     "gemini": _build_gemini_provider,
+    "openrouter": _build_openrouter_provider,
 }
 
 

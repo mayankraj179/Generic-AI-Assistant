@@ -27,6 +27,8 @@ from app.orchestration.model_provider import (
 )
 from app.orchestration.provider_factory import get_model_provider
 from app.services.conversation_store import Conversation, ConversationStore, MessageCitation
+from app.services.embedding import EmbeddingProvider
+from app.services.embedding_provider_factory import get_embedding_provider
 from app.services.gemini_embedding import GeminiEmbeddingProvider
 from app.services.retriever import RetrievalService
 from app.services.vector_store import PgVectorStore
@@ -37,6 +39,24 @@ NO_AUTHORIZED_CONTEXT_REPLY = (
     "I don't have enough information in the documents I'm authorized to "
     "access to answer that question. Please rephrase, or check with someone "
     "who has access to the relevant material."
+)
+
+# Appended to system_prompt (never substituted for it) only for a turn with
+# no document context at all but at least one tool configured — see
+# ChatOrchestrator._prepare_turn. The hard gate lets this turn reach the
+# model instead of refusing outright, so this instruction is what actually
+# prevents a fabricated/document-flavored answer: the model must still
+# decline, on its own, when no available tool genuinely answers the
+# question, exactly the same "state clearly when you can't answer rather
+# than fabricate" principle the rest of this project already applies.
+NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE = (
+    "No document context was retrieved for this turn — you have no "
+    "authorized document content to draw on right now. Do not answer as "
+    "though you do, and never state or imply that an answer is backed by "
+    "the documents or a report. Only answer if one of your available tools "
+    "can directly answer the user's question on its own. If no available "
+    "tool applies, say clearly that you don't have enough information to "
+    "answer rather than guessing, estimating, or fabricating a response."
 )
 
 OUTPUT_GUARDRAIL_FALLBACK_REPLY = (
@@ -123,6 +143,7 @@ def build_grounded_user_turn(*, user_question: str, retrieved_chunks: Sequence[C
 
 
 ProviderFactory = Callable[[AssistantConfig], ModelProvider]
+EmbeddingProviderFactory = Callable[[AssistantConfig], EmbeddingProvider]
 
 
 def _message_requests_chart(message: str, patterns: Sequence[str]) -> bool:
@@ -140,12 +161,17 @@ class _PreparedTurn:
     """Shared setup result for both handle() and handle_stream(): the
     resolved/created conversation, and either a fully-assembled prompt ready
     for the model, or ``prompt=None`` meaning "no authorized/relevant/safe
-    context was found — send the safe reply, never call the model." That
-    ``None`` case now covers three causes uniformly: retrieval found nothing,
-    everything it found scored below the relevance threshold, or everything
-    it found was stripped by prompt-injection screening — all three are the
-    same outcome from the caller's point of view, so they share one path
-    rather than three subtly different messages.
+    context was found, AND no tool could possibly help either — send the
+    safe reply, never call the model." That ``None`` case covers three
+    zero-chunk causes uniformly (retrieval found nothing, everything it
+    found scored below the relevance threshold, or everything it found was
+    stripped by prompt-injection screening — all three are the same outcome
+    from the caller's point of view) AND requires config.enabled_tools to
+    also be empty. When zero chunks coincide with a non-empty
+    enabled_tools, ``prompt`` is still assembled (with an empty
+    retrieved_chunks and an added system-prompt instruction — see
+    NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE) so the model gets a chance at a
+    tool-only answer instead of a hard refusal.
     """
 
     conversation: Conversation
@@ -191,10 +217,18 @@ class ChatOrchestrator:
         retrieval_service: RetrievalService,
         provider_factory: ProviderFactory,
         conversation_store: ConversationStore | None = None,
+        embedding_provider_factory: EmbeddingProviderFactory | None = None,
     ) -> None:
         self._retrieval_service = retrieval_service
         self._provider_factory = provider_factory
         self._conversation_store = conversation_store or ConversationStore()
+        # None (the default — every existing caller/test that doesn't pass
+        # this) preserves the exact prior behavior: RetrievalService.search()
+        # falls back to its own construction-time embedder untouched. Only
+        # build_default_chat_orchestrator wires a real factory, so a config
+        # can opt into a non-Gemini embedding_provider (see
+        # app/services/embedding_provider_factory.py).
+        self._embedding_provider_factory = embedding_provider_factory
 
     async def handle(
         self,
@@ -447,6 +481,11 @@ class ChatOrchestrator:
 
         if retrieval_enabled:
             assert config.retrieval is not None
+            embedder = (
+                self._embedding_provider_factory(config)
+                if self._embedding_provider_factory is not None
+                else None
+            )
             try:
                 raw_chunks = await self._retrieval_service.search(
                     query=message,
@@ -454,27 +493,55 @@ class ChatOrchestrator:
                     assistant_id=config.assistant_id,
                     top_k=config.retrieval.top_k,
                     min_similarity=config.retrieval.min_similarity,
+                    embedder=embedder,
                 )
             except Exception as exc:  # never leak DB/connection details upward
                 raise RetrievalUnavailableError("retrieval backend is unavailable") from exc
 
             chunks = input_guardrails.screen_retrieved_chunks(raw_chunks)
 
-            if not chunks:
+            if not chunks and not config.enabled_tools:
+                # No relevant/authorized document content AND no tools that
+                # could possibly help instead — this is the ONLY remaining
+                # case that hits the hard safe-refusal gate. When
+                # enabled_tools is non-empty we fall through instead of
+                # returning here, so the model gets a chance at a tool-only
+                # answer (see NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE below for
+                # what stops it from fabricating a document-backed one).
+                # Regression guard: an assistant with retrieval on but no
+                # tools configured (e.g. hr_assistant) always takes this
+                # branch on zero chunks, exactly as before this change.
                 return _PreparedTurn(conversation=conversation, prompt=None, chunks=())
 
+        if chunks:
             user_turn = build_grounded_user_turn(user_question=message, retrieved_chunks=chunks)
             chart_requested = _message_requests_chart(message, config.chart_trigger_patterns)
         else:
+            # Either retrieval is off, or it ran and found nothing relevant/
+            # authorized but this assistant has tools configured (see the
+            # gate above) — either way there is no document context to
+            # present, so send the plain question with no "RETRIEVED
+            # CONTEXT:" section at all rather than an empty/confusing one.
             user_turn = message
             chart_requested = False
 
+        system_prompt = config.system_prompt
+        if not chunks and config.enabled_tools:
+            # Tools are this turn's only possible route to a real answer —
+            # the hard gate no longer protects this case, so the model must
+            # be told explicitly not to fabricate a document-backed answer,
+            # and to decline on its own if no available tool actually
+            # applies to this question either.
+            system_prompt = f"{system_prompt}\n\n{NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE}"
+
         prompt = GroundedPrompt(
-            system_prompt=config.system_prompt,
+            system_prompt=system_prompt,
             user_message=user_turn,
             retrieved_chunks=tuple(chunks),
             prior_turns=prior_turns,
             chart_requested=chart_requested,
+            enabled_tools=tuple(config.enabled_tools),
+            max_tool_calls=config.max_tool_calls,
         )
         return _PreparedTurn(conversation=conversation, prompt=prompt, chunks=tuple(chunks))
 
@@ -606,8 +673,16 @@ class ChatOrchestrator:
 def build_default_chat_orchestrator(*, settings: Settings) -> ChatOrchestrator:
     """Construct the orchestrator using the framework's real embedding
     provider and vector-store implementation, resolving each assistant's
-    model provider from its own configuration at call time.
+    model provider — and, independently, each assistant's embedding
+    provider (see RetrievalConfig.embedding_provider) — from its own
+    configuration at call time.
     """
+    # Gemini stays RetrievalService's own construction-time default — every
+    # assistant whose config doesn't set retrieval.embedding_provider (i.e.
+    # every assistant that predates this field) resolves to this exact same
+    # GeminiEmbeddingProvider via embedding_provider_factory below anyway,
+    # so behavior is unchanged; this is just also RetrievalService's
+    # fallback for any caller that bypasses the factory entirely.
     embedder = GeminiEmbeddingProvider(api_key=settings.gemini_api_key)
     vector_store = PgVectorStore()
     retrieval_service = RetrievalService(embedder=embedder, vector_store=vector_store)
@@ -615,4 +690,11 @@ def build_default_chat_orchestrator(*, settings: Settings) -> ChatOrchestrator:
     def provider_factory(config: AssistantConfig) -> ModelProvider:
         return get_model_provider(model=config.model, settings=settings)
 
-    return ChatOrchestrator(retrieval_service=retrieval_service, provider_factory=provider_factory)
+    def embedding_provider_factory(config: AssistantConfig) -> EmbeddingProvider:
+        return get_embedding_provider(config=config, settings=settings)
+
+    return ChatOrchestrator(
+        retrieval_service=retrieval_service,
+        provider_factory=provider_factory,
+        embedding_provider_factory=embedding_provider_factory,
+    )

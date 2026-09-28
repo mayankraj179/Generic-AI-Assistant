@@ -16,8 +16,48 @@ from app.orchestration.model_provider import (
     ModelReply,
     ModelStreamEvent,
 )
+from app.tools.builtin import TOOL_REGISTRY, calculate, current_datetime
 
 logger = logging.getLogger(__name__)
+
+# Returned instead of raising when the tool-call loop hits its bound
+# (RunConfig.max_llm_calls, set from GroundedPrompt.max_tool_calls) without
+# the model reaching a final text answer — an honest "I couldn't finish"
+# reply, never a truncated or fabricated one.
+TOOL_LOOP_EXHAUSTED_REPLY = (
+    "I wasn't able to finish answering using the available tools within the "
+    "allowed number of steps. Please try rephrasing your question or "
+    "breaking it into smaller parts."
+)
+
+# Maps GroundedPrompt.enabled_tools names to the actual Python function
+# google-adk's FunctionTool wraps. FunctionTool derives the tool name the
+# model sees from the function's own __name__ (verified against the
+# installed SDK — FunctionTool.__init__ takes no name-override parameter),
+# so these functions are named exactly "current_datetime"/"calculate" in
+# app/tools/builtin.py for that reason.
+_TOOL_FUNCTIONS_BY_NAME = {
+    "current_datetime": current_datetime,
+    "calculate": calculate,
+}
+
+
+def _build_function_tools(enabled_tools: tuple[str, ...], FunctionTool: Any) -> list[Any]:
+    """Resolves GroundedPrompt.enabled_tools into google-adk FunctionTool
+    instances. Silently skips any name not in TOOL_REGISTRY/
+    _TOOL_FUNCTIONS_BY_NAME rather than raising — AssistantConfig's own
+    field_validator (app/config/assistant_config.py) already rejects an
+    unknown tool name at config-load time, long before a request reaches
+    here, so this is defense in depth, not the primary validation point.
+    """
+    tools = []
+    for name in enabled_tools:
+        if name not in TOOL_REGISTRY:
+            continue
+        func = _TOOL_FUNCTIONS_BY_NAME.get(name)
+        if func is not None:
+            tools.append(FunctionTool(func))
+    return tools
 
 
 # Structured-output schema for the chart-extraction call — a Pydantic model
@@ -114,19 +154,31 @@ class GeminiProvider:
     async def generate(self, prompt: GroundedPrompt) -> ModelReply:
         try:
             from google.adk.agents import Agent
+            from google.adk.agents.invocation_context import LlmCallsLimitExceededError
+            from google.adk.agents.run_config import RunConfig
             from google.adk.events.event import Event
             from google.adk.models.google_llm import Gemini
             from google.adk.runners import InMemoryRunner
+            from google.adk.tools import FunctionTool
             from google.genai import types as genai_types
         except ImportError as exc:  # pragma: no cover - depends on optional SDK
             raise ModelProviderError(
                 "Google ADK / google-genai SDK is not installed"
             ) from exc
 
+        tools = _build_function_tools(prompt.enabled_tools, FunctionTool)
+        # Tool calls happen as extra LLM round-trips *inside* this same
+        # run_async() call (google-adk's Runner executes each proposed
+        # FunctionTool call and feeds the result back internally — no
+        # separate loop needed here, unlike OpenRouterProvider's manual one)
+        # — so the run-wide cap is what bounds them. +1 allows one final
+        # answer-producing call after up to max_tool_calls tool round-trips.
+        run_config = RunConfig(max_llm_calls=prompt.max_tool_calls + 1)
+
         try:
             runner, session, user_id = await self._new_seeded_session(
                 prompt, Agent=Agent, Event=Event, Gemini=Gemini,
-                InMemoryRunner=InMemoryRunner, genai_types=genai_types,
+                InMemoryRunner=InMemoryRunner, genai_types=genai_types, tools=tools,
             )
 
             final_text: str | None = None
@@ -136,6 +188,7 @@ class GeminiProvider:
                 new_message=genai_types.UserContent(
                     parts=[genai_types.Part(text=prompt.user_message)]
                 ),
+                run_config=run_config,
             ):
                 if event.error_message:
                     raise ModelProviderError(
@@ -145,6 +198,10 @@ class GeminiProvider:
                     final_text = "".join(
                         part.text or "" for part in event.content.parts
                     ).strip()
+        except LlmCallsLimitExceededError:
+            return ModelReply(
+                text=TOOL_LOOP_EXHAUSTED_REPLY, grounded=_is_grounded(prompt), chart=None
+            )
         except ModelProviderError:
             raise
         except Exception as exc:  # network/auth/SDK failures from the ADK/genai stack
@@ -159,15 +216,19 @@ class GeminiProvider:
     async def generate_stream(self, prompt: GroundedPrompt) -> AsyncIterator[ModelStreamEvent]:
         try:
             from google.adk.agents import Agent
+            from google.adk.agents.invocation_context import LlmCallsLimitExceededError
             from google.adk.agents.run_config import RunConfig, StreamingMode
             from google.adk.events.event import Event
             from google.adk.models.google_llm import Gemini
             from google.adk.runners import InMemoryRunner
+            from google.adk.tools import FunctionTool
             from google.genai import types as genai_types
         except ImportError as exc:  # pragma: no cover - depends on optional SDK
             raise ModelProviderError(
                 "Google ADK / google-genai SDK is not installed"
             ) from exc
+
+        tools = _build_function_tools(prompt.enabled_tools, FunctionTool)
 
         # StreamingMode.SSE is what actually makes run_async yield incremental
         # partial-text events instead of one blocking final event — verified
@@ -182,13 +243,16 @@ class GeminiProvider:
         # close() (partial=False, content is the full merged text) — exactly
         # mirroring what event.is_final_response() already detects in
         # generate() above. Not guessed.
-        run_config = RunConfig(streaming_mode=StreamingMode.SSE)
+        run_config = RunConfig(
+            streaming_mode=StreamingMode.SSE, max_llm_calls=prompt.max_tool_calls + 1
+        )
 
         final_text: str | None = None
+        loop_exhausted = False
         try:
             runner, session, user_id = await self._new_seeded_session(
                 prompt, Agent=Agent, Event=Event, Gemini=Gemini,
-                InMemoryRunner=InMemoryRunner, genai_types=genai_types,
+                InMemoryRunner=InMemoryRunner, genai_types=genai_types, tools=tools,
             )
 
             async for event in runner.run_async(
@@ -212,10 +276,21 @@ class GeminiProvider:
                     delta_text = "".join(part.text or "" for part in event.content.parts)
                     if delta_text:
                         yield ModelStreamEvent(delta=delta_text)
+        except LlmCallsLimitExceededError:
+            loop_exhausted = True
         except ModelProviderError:
             raise
         except Exception as exc:  # network/auth/SDK failures from the ADK/genai stack
             raise ModelProviderError("Gemini request failed") from exc
+
+        if loop_exhausted:
+            yield ModelStreamEvent(
+                is_final=True,
+                text=TOOL_LOOP_EXHAUSTED_REPLY,
+                grounded=_is_grounded(prompt),
+                chart=None,
+            )
+            return
 
         if not final_text:
             raise ModelProviderError("Gemini returned an empty response")
@@ -321,6 +396,7 @@ class GeminiProvider:
         Gemini: Any,
         InMemoryRunner: Any,
         genai_types: Any,
+        tools: list[Any] | None = None,
     ) -> tuple[Any, Any, str]:
         """Builds a fresh Agent/Runner/session and replays prior conversation
         turns into it — the shared setup behind both generate() and
@@ -333,6 +409,7 @@ class GeminiProvider:
             name=self.AGENT_NAME,
             model=Gemini(model=self._model_name, client_kwargs={"api_key": self._api_key}),
             instruction=prompt.system_prompt,
+            tools=tools or [],
         )
         runner = InMemoryRunner(agent=agent, app_name="generic-ai-assistant-framework")
 
