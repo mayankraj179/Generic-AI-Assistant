@@ -16,6 +16,11 @@ class EmbeddingProviderError(Exception):
     path (app/orchestration/model_provider.py).
     """
 
+    def __init__(self, message: str = "", *, failure: object = None) -> None:
+        super().__init__(message)
+        self.failure = failure
+
+
 
 class EmbeddingProvider(Protocol):
     """Provider-neutral embedding boundary.

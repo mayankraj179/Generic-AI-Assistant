@@ -45,6 +45,16 @@ services:
       timeout: 10s
       retries: 20
 
+  # Local trace viewer. The backend exports to it when OTEL_TRACES_EXPORTER=otlp
+  # (see backend/.env.example). In-memory storage: traces are gone on restart.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI: http://localhost:16686
+      - "4318:4318"     # OTLP over HTTP
+
 volumes:
   postgres_data:
   keycloak_data:

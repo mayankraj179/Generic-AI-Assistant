@@ -7,6 +7,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from app.observability.audit import record_provider_call, record_tokens, record_tool_call
+from app.observability.provider_errors import (
+    classify_exception,
+    classify_google,
+    log_chart_extraction_failure,
+)
 from app.orchestration.model_provider import (
     ChartSeries,
     ChartSourceChunk,
@@ -192,8 +198,16 @@ class GeminiProvider:
             ):
                 if event.error_message:
                     raise ModelProviderError(
-                        f"Gemini returned an error (code={event.error_code})"
+                        f"Gemini returned an error (code={event.error_code})",
+                        failure=classify_google(
+                            code=None,
+                            status=event.error_code,
+                            message=event.error_message,
+                            operation="chat",
+                            model=self._model_name,
+                        ),
                     )
+                self._observe_event(event)
                 if event.is_final_response() and event.content and event.content.parts:
                     final_text = "".join(
                         part.text or "" for part in event.content.parts
@@ -205,7 +219,12 @@ class GeminiProvider:
         except ModelProviderError:
             raise
         except Exception as exc:  # network/auth/SDK failures from the ADK/genai stack
-            raise ModelProviderError("Gemini request failed") from exc
+            raise ModelProviderError(
+                "Gemini request failed",
+                failure=classify_exception(
+                    exc, provider="gemini", operation="chat", model=self._model_name
+                ),
+            ) from exc
 
         if not final_text:
             raise ModelProviderError("Gemini returned an empty response")
@@ -265,8 +284,16 @@ class GeminiProvider:
             ):
                 if event.error_message:
                     raise ModelProviderError(
-                        f"Gemini returned an error (code={event.error_code})"
+                        f"Gemini returned an error (code={event.error_code})",
+                        failure=classify_google(
+                            code=None,
+                            status=event.error_code,
+                            message=event.error_message,
+                            operation="chat",
+                            model=self._model_name,
+                        ),
                     )
+                self._observe_event(event)
                 if event.is_final_response() and event.content and event.content.parts:
                     final_text = "".join(
                         part.text or "" for part in event.content.parts
@@ -281,7 +308,12 @@ class GeminiProvider:
         except ModelProviderError:
             raise
         except Exception as exc:  # network/auth/SDK failures from the ADK/genai stack
-            raise ModelProviderError("Gemini request failed") from exc
+            raise ModelProviderError(
+                "Gemini request failed",
+                failure=classify_exception(
+                    exc, provider="gemini", operation="chat", model=self._model_name
+                ),
+            ) from exc
 
         if loop_exhausted:
             yield ModelStreamEvent(
@@ -345,6 +377,7 @@ class GeminiProvider:
             f"USER QUESTION:\n{prompt.user_message}"
         )
 
+        record_provider_call("model", "gemini", self._model_name)
         try:
             client = Client(api_key=self._api_key)
             response = await client.aio.models.generate_content(
@@ -355,8 +388,16 @@ class GeminiProvider:
                     response_schema=_ChartExtractionSchema,
                 ),
             )
-        except Exception:
-            logger.warning("chart extraction request failed; continuing without a chart")
+        except Exception as exc:
+            log_chart_extraction_failure(
+                logger,
+                exc,
+                provider="gemini",
+                model=self._model_name,
+                failure=classify_exception(
+                    exc, provider="gemini", operation="chart", model=self._model_name
+                ),
+            )
             return None
 
         parsed = response.parsed
@@ -387,6 +428,40 @@ class GeminiProvider:
             logger.warning("discarding a malformed chart extraction response")
             return None
 
+    def _count_model_call(self, callback_context: Any, llm_request: Any) -> None:
+        """ADK before_model_callback: runs once per model request ADK makes,
+        so tool-call rounds are counted too. Returns None: never alters the
+        request."""
+        record_provider_call("model", "gemini", self._model_name)
+        return None
+
+    def _observe_event(self, event: Any) -> None:
+        """Token usage and tool outcomes from ADK events, for the turn audit.
+        Partial streaming events are skipped so usage isn't counted twice."""
+        usage = getattr(event, "usage_metadata", None)
+        if usage is not None and not getattr(event, "partial", False):
+            # Gemini 2.5 bills thinking tokens as output, and they can dwarf
+            # the visible answer (live: 77 visible vs 1,658 thinking), so
+            # completion tokens are candidates + thoughts.
+            visible = getattr(usage, "candidates_token_count", None)
+            thoughts = getattr(usage, "thoughts_token_count", None)
+            completion = None if visible is None and thoughts is None else (
+                (visible or 0) + (thoughts or 0)
+            )
+            record_tokens(
+                "model",
+                "gemini",
+                self._model_name,
+                prompt_tokens=getattr(usage, "prompt_token_count", None),
+                completion_tokens=completion,
+            )
+        for response in event.get_function_responses() or []:
+            result = response.response if isinstance(response.response, dict) else {}
+            error = result.get("error")
+            record_tool_call(
+                response.name or "", ok=error is None, error=str(error) if error else None
+            )
+
     async def _new_seeded_session(
         self,
         prompt: GroundedPrompt,
@@ -410,6 +485,7 @@ class GeminiProvider:
             model=Gemini(model=self._model_name, client_kwargs={"api_key": self._api_key}),
             instruction=prompt.system_prompt,
             tools=tools or [],
+            before_model_callback=self._count_model_call,
         )
         runner = InMemoryRunner(agent=agent, app_name="generic-ai-assistant-framework")
 

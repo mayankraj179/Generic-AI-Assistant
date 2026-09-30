@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from app.observability.audit import record_provider_call
+from app.observability.provider_errors import classify_exception
 from app.services.embedding import EmbeddingProviderError
 
 # gemini-embedding-001's native output dimension — confirmed live against
@@ -81,6 +83,7 @@ class GeminiEmbeddingProvider:
         except ImportError as exc:  # pragma: no cover - depends on optional SDK
             raise EmbeddingProviderError("google-genai SDK is not installed") from exc
 
+        record_provider_call("embedding", "gemini", self._model_name)
         try:
             client = Client(api_key=self._api_key)
             response = await client.aio.models.embed_content(
@@ -89,7 +92,12 @@ class GeminiEmbeddingProvider:
                 config=genai_types.EmbedContentConfig(task_type=task_type),
             )
         except Exception as exc:  # network/auth/rate-limit failures from the SDK
-            raise EmbeddingProviderError("Gemini embedding request failed") from exc
+            raise EmbeddingProviderError(
+                "Gemini embedding request failed",
+                failure=classify_exception(
+                    exc, provider="gemini", operation="embedding", model=self._model_name
+                ),
+            ) from exc
 
         embeddings = response.embeddings or []
         if len(embeddings) != len(texts):

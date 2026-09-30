@@ -1,19 +1,17 @@
-assistant_id: finance_assistant
-display_name: Financial Report Analysis Assistant
-description: Answers questions about ingested financial reports using RAG over report documents.
+assistant_id: finance_assistant_grok
+display_name: Financial Report Analysis Assistant (Grok)
+description: Same finance corpus, prompt and tools as finance_assistant, answered by xAI Grok, for side-by-side comparison with the Nemotron-backed finance_assistant.
 tenant_id: bitwise-global
 
 model:
-  # Back on OpenRouter (2026-09-30): its daily free quota reset, and Gemini's
-  # smaller generation cap is kept for chart and Grok-comparison testing. To
-  # use Gemini instead: provider gemini, model_name gemini-2.5-flash,
-  # embedding_provider gemini (no embedding_model), min_similarity 0.66 (hr) /
-  # 0.645 (finance), then re-ingest (a model change always makes a new
-  # generation; it never reactivates an old one).
-  provider: openrouter
-  model_name: nvidia/nemotron-3-super-120b-a12b:free
+  # xAI directly (GrokProvider), not via OpenRouter. grok-4.3 is the cheapest
+  # current general model in docs.x.ai/developers/models ($1.25/$2.50 per 1M).
+  provider: xai
+  model_name: grok-4.3
   supports_tools: true
-  supports_streaming: true
+  # GrokProvider.generate_stream() is not built yet. Nothing enforces this
+  # flag, so /chat/stream would return an in-band error event for now.
+  supports_streaming: false
   thinking_level: null
   configurable_thinking: false
   max_context_tokens: 128000
@@ -23,21 +21,18 @@ retrieval:
   collection_name: finance_reports
   exact_search_threshold: 500
   top_k: 12
-  # nvidia/nemotron-3-embed-1b:free, measured 2026-09-28 against this corpus
-  # (nova_horizon_fy2025, bitwise_leave_policy, holidays_2026); the correct
-  # document ranked first for every relevant query.
-  #   Relevant top-1 (n=12): HR/holiday 0.5063-0.6446, net profit 0.6002,
-  #   revenue 0.5639, gross margin 0.2304, "how much cash" 0.1635.
-  #   Unrelated / off-domain top-1 (n=6): 0.0448-0.1823.
-  # No threshold separates these cleanly: short table-figure questions score
-  # below the strongest unrelated query. 0.20 rejects every measured unrelated
-  # query (+0.018) and keeps gross margin (+0.030), at the cost of "how much
-  # cash" failing closed. (Gemini embeddings use 0.645.)
-  min_similarity: 0.20
-  # Explicit rather than relying on RetrievalConfig's default, so the
-  # provider can never change as a side effect of a default change.
-  embedding_provider: openrouter
-  embedding_model: nvidia/nemotron-3-embed-1b:free
+  # TEMP, measured 2026-09-29 against this assistant's gemini-embedding-001
+  # chunks (nova_horizon_fy2025, bitwise_leave_policy, holidays_2026).
+  # Relevant top-1 0.6619-0.7801 (n=13, correct document first every time;
+  # "how much cash" 0.6619, gross margin 0.6730, revenue chart 0.7219).
+  # Unrelated/off-domain top-1 up to 0.6287 (n=8). 0.645 is mid-gap, but the
+  # gap is only ~0.033 (about +/-0.017 margin).
+  min_similarity: 0.645
+  # TEMP (2026-09-29): Gemini embeddings (gemini-embedding-001, the provider
+  # default) so this Grok assistant isn't blocked by OpenRouter's daily
+  # free-model quota. Temporary testing choice, not a decision: revisit the
+  # embedding provider for all Grok configs later.
+  embedding_provider: gemini
 
 named_queries: []
 

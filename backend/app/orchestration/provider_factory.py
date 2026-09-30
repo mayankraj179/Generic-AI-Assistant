@@ -5,6 +5,7 @@ from collections.abc import Callable
 from app.config.assistant_config import ModelCapabilities
 from app.config.settings import Settings
 from app.orchestration.gemini_provider import GeminiProvider
+from app.orchestration.grok_provider import GrokProvider
 from app.orchestration.model_provider import ModelProvider, ModelProviderError
 from app.orchestration.openrouter_provider import OpenRouterProvider
 
@@ -19,10 +20,15 @@ def _build_openrouter_provider(model: ModelCapabilities, settings: Settings) -> 
     return OpenRouterProvider(model_name=model.model_name, api_key=settings.openrouter_api_key)
 
 
+def _build_xai_provider(model: ModelCapabilities, settings: Settings) -> ModelProvider:
+    return GrokProvider(model_name=model.model_name, api_key=settings.xai_api_key)
+
+
 _PROVIDER_BUILDERS: dict[str, _ProviderBuilder] = {
     "google_adk": _build_gemini_provider,
     "gemini": _build_gemini_provider,
     "openrouter": _build_openrouter_provider,
+    "xai": _build_xai_provider,
 }
 
 

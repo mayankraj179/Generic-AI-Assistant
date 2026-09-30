@@ -160,3 +160,47 @@ class MessageRecord(Base):
         server_default=func.now(),
     )
     conversation: Mapped[ConversationRecord] = relationship(back_populates="messages")
+
+
+class TurnAuditRecord(Base):
+    """Operational metadata for one chat turn (alembic 0006): which provider
+    and model handled it, whether it was grounded, what tools and guardrails
+    did, how many provider calls it made, and how it failed if it did. No
+    message content; the conversation itself lives in messages. There is no
+    foreign key to conversations, so a row survives a deleted conversation and
+    exists for failed turns, which persist no messages."""
+
+    __tablename__ = "turn_audit"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    operation: Mapped[str] = mapped_column(String, nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String, nullable=False)
+    assistant_id: Mapped[str] = mapped_column(String, nullable=False)
+    principal_ref: Mapped[str] = mapped_column(String, nullable=False)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    model_name: Mapped[str] = mapped_column(String, nullable=False)
+    embedding_model: Mapped[str | None] = mapped_column(String, nullable=True)
+    outcome: Mapped[str] = mapped_column(String, nullable=False)
+    grounded: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    citations_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    retrieval: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    chart_returned: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    tool_calls: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, server_default="[]")
+    guardrail_actions: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
+    provider_calls: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, server_default="[]")
+    error_kind: Mapped[str | None] = mapped_column(String, nullable=True)
+    error: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)

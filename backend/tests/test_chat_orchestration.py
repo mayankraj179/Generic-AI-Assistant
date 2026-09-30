@@ -549,6 +549,62 @@ async def test_citation_downgrade_when_model_refuses_despite_grounded_retrieval(
     assert result.citations == ()
 
 
+_HOLIDAY_CHUNK_TEXT = (
+    "Christmas  2026-12-25 (Friday)  India  Yes\n"
+    "Rest all days are NOT Floating Holidays."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply_text",
+    [
+        # Direct-answer-first style the system prompts now ask for.
+        'No, 24 December is not a floating holiday. The India list states "Rest all '
+        'days are NOT Floating Holidays." (source: holidays_2026, chunk 3)',
+        "Yes, Republic Day is an Official Holiday, not a floating holiday.",
+        # The older hedged style — also a real grounded answer, not a refusal.
+        "Based on the provided content, December 24th is not listed as a floating "
+        'holiday. The lists state that "Rest all days are NOT Floating Holidays."',
+    ],
+)
+async def test_definitive_negative_answer_keeps_grounding_and_citations(reply_text):
+    # A grounded "No, X is not Y" answer must not be mistaken for a refusal by
+    # the output guardrail's refusal-phrase detection.
+    retrieval = FakeRetrievalService([_make_chunk(_HOLIDAY_CHUNK_TEXT)])
+    provider = FakeModelProvider(reply_text=reply_text)
+    orchestrator = _make_orchestrator(retrieval=retrieval, provider=provider)
+
+    result = await orchestrator.handle(
+        principal=_principal(), config=_make_config(), message="Is 24th Dec a floating holiday?"
+    )
+
+    assert result.text == reply_text
+    assert result.grounded is True
+    assert [(c.document_title, c.chunk_index) for c in result.citations] == [("leave_policy", 0)]
+
+
+@pytest.mark.asyncio
+async def test_negative_answer_phrased_as_not_mentioned_in_documents_is_downgraded():
+    # Pins a known limit of the regex refusal detector: "not mentioned in the
+    # provided documents" is treated as a refusal even inside an otherwise
+    # definitive answer. The system prompts steer catch-all answers to quote
+    # the catch-all statement instead; if this detector changes, revisit them.
+    retrieval = FakeRetrievalService([_make_chunk(_HOLIDAY_CHUNK_TEXT)])
+    provider = FakeModelProvider(
+        reply_text="No, 24 December is not a floating holiday; it is not mentioned in "
+        "the provided documents."
+    )
+    orchestrator = _make_orchestrator(retrieval=retrieval, provider=provider)
+
+    result = await orchestrator.handle(
+        principal=_principal(), config=_make_config(), message="Is 24th Dec a floating holiday?"
+    )
+
+    assert result.grounded is False
+    assert result.citations == ()
+
+
 @pytest.mark.asyncio
 async def test_output_pii_is_logged_but_not_blocked_by_default():
     retrieval = FakeRetrievalService([_make_chunk()])

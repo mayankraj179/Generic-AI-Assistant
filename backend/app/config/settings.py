@@ -67,6 +67,13 @@ class Settings(BaseSettings):
             "openrouter_api_key",
         ),
     )
+    xai_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "XAI_API_KEY",
+            "xai_api_key",
+        ),
+    )
 
     @field_validator("development_permission_set", mode="before")
     @classmethod

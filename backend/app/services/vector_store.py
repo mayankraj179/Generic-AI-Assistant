@@ -1,14 +1,33 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Sequence
+from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.database import create_session_factory
 from app.db.models import ChunkRecord, DocumentRecord
 from app.ingestion.pipeline import Chunk
+
+logger = logging.getLogger(__name__)
+
+
+def _authorized_chunk_predicates(
+    *, tenant_id: str, assistant_id: str, principal_labels: frozenset[str]
+) -> list[Any]:
+    """The single definition of which chunk rows a principal may read: same
+    tenant and assistant, the current generation only, and at least one
+    shared access label. Used by both search() and fetch_cited_chunks() so
+    the access rule can't drift between them."""
+    return [
+        ChunkRecord.tenant_id == tenant_id,
+        ChunkRecord.assistant_id == assistant_id,
+        ChunkRecord.is_current.is_(True),
+        ChunkRecord.access_labels.op("&&")(list(sorted(principal_labels))),
+    ]
 
 
 class PgVectorStore:
@@ -186,15 +205,16 @@ class PgVectorStore:
                 )
                 .join(DocumentRecord, DocumentRecord.id == ChunkRecord.document_id)
                 .where(
-                    ChunkRecord.tenant_id == tenant_id,
-                    ChunkRecord.assistant_id == assistant_id,
-                    ChunkRecord.is_current.is_(True),
+                    *_authorized_chunk_predicates(
+                        tenant_id=tenant_id,
+                        assistant_id=assistant_id,
+                        principal_labels=principal_labels,
+                    ),
                     # Only chunks in the query's own vector space — see
                     # ChunkRecord.embedding. Chunks left over from an
                     # assistant's previous embedding model are invisible
                     # until re-ingested, rather than scored meaninglessly.
                     ChunkRecord.embedding_model == embedding_model,
-                    ChunkRecord.access_labels.op("&&")(list(sorted(principal_labels))),
                 )
                 .order_by(distance)
                 .limit(top_k)
@@ -214,3 +234,66 @@ class PgVectorStore:
                     )
                 )
             return matches
+
+    async def fetch_cited_chunks(
+        self,
+        *,
+        tenant_id: str,
+        assistant_id: str,
+        principal_labels: frozenset[str],
+        citations: Sequence[tuple[str, int]],
+    ) -> list[Chunk]:
+        """Re-resolves persisted (document_title, chunk_index) citations to
+        chunks the principal may read right now, under the same access rule
+        as search(). A citation is dropped when it no longer resolves (access
+        revoked, document gone) and also when its title matches more than one
+        readable document, since the original turn's document can't then be
+        told apart. Returned in citation order, without similarity scores."""
+        wanted = list(dict.fromkeys(citations))
+        if not principal_labels or not wanted:
+            return []
+
+        async with self._session_factory() as session:
+            stmt = (
+                select(ChunkRecord, DocumentRecord.title.label("document_title"))
+                .join(DocumentRecord, DocumentRecord.id == ChunkRecord.document_id)
+                .where(
+                    *_authorized_chunk_predicates(
+                        tenant_id=tenant_id,
+                        assistant_id=assistant_id,
+                        principal_labels=principal_labels,
+                    ),
+                    or_(
+                        *(
+                            and_(DocumentRecord.title == title, ChunkRecord.chunk_index == index)
+                            for title, index in wanted
+                        )
+                    ),
+                )
+            )
+            rows = await session.execute(stmt)
+
+        found: dict[tuple[str, int], list[Chunk]] = {}
+        for row, document_title in rows:
+            found.setdefault((document_title, row.chunk_index), []).append(
+                Chunk(
+                    document_title=document_title,
+                    chunk_index=row.chunk_index,
+                    display_text=row.display_text,
+                    embedded_text=row.embedded_text,
+                    access_labels=frozenset(row.access_labels or []),
+                )
+            )
+
+        resolved: list[Chunk] = []
+        for key in wanted:
+            matches = found.get(key, [])
+            if len(matches) == 1:
+                resolved.append(matches[0])
+            elif len(matches) > 1:
+                logger.warning(
+                    "dropping ambiguous cited chunk %s: its title matches %d documents",
+                    key,
+                    len(matches),
+                )
+        return resolved

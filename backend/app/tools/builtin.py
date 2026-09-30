@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.tool_definition import ToolDefinition, ToolKind
+from app.observability.audit import record_tool_call
+from app.observability.tracing import start_span
 
 # ---------------------------------------------------------------------------
 # The framework's only two built-in tools — a deliberately small, local,
@@ -299,10 +302,19 @@ async def execute_tool(name: str, arguments: dict) -> dict:
     structured error back to the model instead" discipline the tool
     implementations themselves already apply to malformed input values.
     """
-    func = _TOOL_FUNCTIONS.get(name)
-    if func is None:
-        raise ToolExecutionError(f"unknown tool '{name}'")
-    try:
-        return func(**arguments)
-    except TypeError as exc:
-        return {"error": f"invalid arguments for '{name}': {exc}"}
+    # Traced and audited here for the OpenRouter/xAI tool loops. Gemini's
+    # tools are invoked by google-adk directly, which traces them itself
+    # (execute_tool spans); GeminiProvider audits them from ADK events.
+    with start_span(f"tool.{name}", tool=name, arguments=json.dumps(arguments)[:500]) as span:
+        func = _TOOL_FUNCTIONS.get(name)
+        if func is None:
+            record_tool_call(name, ok=False, error="unknown tool")
+            raise ToolExecutionError(f"unknown tool '{name}'")
+        try:
+            result = func(**arguments)
+        except TypeError as exc:
+            result = {"error": f"invalid arguments for '{name}': {exc}"}
+        error = result.get("error") if isinstance(result, dict) else None
+        span.set_attribute("tool.ok", error is None)
+        record_tool_call(name, ok=error is None, error=str(error) if error else None)
+        return result

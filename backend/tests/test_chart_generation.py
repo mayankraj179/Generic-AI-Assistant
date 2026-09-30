@@ -14,6 +14,9 @@ from app.config.assistant_config import (
 from app.core.principal import PrincipalContext
 from app.ingestion.pipeline import Chunk
 from app.orchestration.chat_service import (
+    CHART_TURN_GUIDANCE,
+    CHART_WITHOUT_CONTEXT_GUIDANCE,
+    NO_AUTHORIZED_CONTEXT_REPLY,
     ChatOrchestrator,
     ChatStreamChart,
     ChatStreamDelta,
@@ -28,7 +31,7 @@ from app.orchestration.model_provider import (
     ModelReply,
     ModelStreamEvent,
 )
-from app.services.conversation_store import ConversationNotFoundError
+from app.services.conversation_store import ConversationNotFoundError, MessageCitation
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / fakes (self-contained — mirrors test_chat_orchestration.py's
@@ -485,3 +488,341 @@ async def test_handle_stream_no_chart_event_when_source_chunks_unauthorized():
     done_events = [e for e in events if isinstance(e, ChatStreamDone)]
     assert len(done_events) == 1
     assert not any(isinstance(e, ChatStreamError) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Chart follow-ups that reuse the previous answer's cited chunks
+# ---------------------------------------------------------------------------
+
+
+_REVENUE = "FY2021 42.3 | FY2022 51.8 | FY2023 63.4 | FY2024 79.1 | FY2025 96.5"
+_PRIOR_CITATION = (MessageCitation(document_title="nova_horizon_fy2025", chunk_index=0),)
+
+
+def _finance_chunk(*, labels: frozenset[str] = frozenset({"role:authenticated"})) -> Chunk:
+    return Chunk(
+        document_title="nova_horizon_fy2025",
+        chunk_index=0,
+        display_text=_REVENUE,
+        embedded_text=f"nova_horizon_fy2025: {_REVENUE}",
+        access_labels=labels,
+    )
+
+
+def _revenue_chart(source: tuple[str, int] = ("nova_horizon_fy2025", 0)) -> ChartSpec:
+    return ChartSpec(
+        chart_type="line",
+        title="Revenue",
+        labels=["FY2021", "FY2022", "FY2023", "FY2024", "FY2025"],
+        series=[ChartSeries(name="Revenue ($M)", values=[42.3, 51.8, 63.4, 79.1, 96.5])],
+        source_chunks=[ChartSourceChunk(document_title=source[0], chunk_index=source[1])],
+    )
+
+
+class FakeFollowUpRetrievalService:
+    """search() returns ``fresh`` (nothing, for a vague follow-up).
+    fetch_cited_chunks() resolves citations from ``stored`` and applies the
+    same label-overlap rule the real store does, so revoked access is
+    actually simulated rather than stubbed as an empty list."""
+
+    def __init__(self, *, stored: list[Chunk], fresh: list[Chunk] | None = None):
+        self.stored = {(c.document_title, c.chunk_index): c for c in stored}
+        self.fresh = fresh or []
+        self.search_calls: list[str] = []
+        self.fetch_calls: list[dict] = []
+
+    async def search(
+        self, *, query, principal, assistant_id, top_k, min_similarity=0.0, embedder=None
+    ):
+        self.search_calls.append(query)
+        return self.fresh
+
+    async def fetch_cited_chunks(self, *, citations, principal, assistant_id):
+        self.fetch_calls.append(
+            {"citations": list(citations), "principal": principal, "assistant_id": assistant_id}
+        )
+        return [
+            self.stored[key]
+            for key in citations
+            if key in self.stored and self.stored[key].access_labels & principal.labels
+        ]
+
+
+async def _conversation_after_grounded_answer(store, principal, *, citations=_PRIOR_CITATION):
+    conversation = await store.create_conversation(principal=principal, assistant_id="hr_assistant")
+    await store.append_message(
+        conversation_id=conversation.id,
+        principal=principal,
+        role="user",
+        content="what are profit and revenue in the last 5 years",
+    )
+    await store.append_message(
+        conversation_id=conversation.id,
+        principal=principal,
+        role="assistant",
+        content="Revenue was 42.3, 51.8, 63.4, 79.1 and 96.5.",
+        citations=citations,
+    )
+    return conversation.id
+
+
+def _cited(items) -> list[tuple[str, int]]:
+    return [(c.document_title, c.chunk_index) for c in items]
+
+
+@pytest.mark.asyncio
+async def test_chart_follow_up_reuses_previous_answers_chunks_and_produces_a_chart():
+    store = FakeConversationStore()
+    principal = _principal()
+    conversation_id = await _conversation_after_grounded_answer(store, principal)
+    retrieval = FakeFollowUpRetrievalService(stored=[_finance_chunk()])
+    provider = FakeChartModelProvider(chart=_revenue_chart())
+    orchestrator = _make_orchestrator(
+        retrieval=retrieval, provider=provider, conversation_store=store
+    )
+
+    result = await orchestrator.handle(
+        principal=principal,
+        config=_make_config(),
+        message="Plot a graph of these for me",
+        conversation_id=conversation_id,
+    )
+
+    assert retrieval.search_calls == ["Plot a graph of these for me"]
+    assert retrieval.fetch_calls[0]["citations"] == [("nova_horizon_fy2025", 0)]
+    assert retrieval.fetch_calls[0]["principal"] is principal
+    prompt = provider.calls[0]
+    assert prompt.chart_requested is True
+    assert _cited(prompt.retrieved_chunks) == [("nova_horizon_fy2025", 0)]
+    assert CHART_WITHOUT_CONTEXT_GUIDANCE not in prompt.system_prompt
+    assert CHART_TURN_GUIDANCE in prompt.system_prompt
+    assert result.grounded is True
+    assert _cited(result.citations) == [("nova_horizon_fy2025", 0)]
+    assert result.chart is not None
+    assert result.chart.series[0].values == [42.3, 51.8, 63.4, 79.1, 96.5]
+
+
+@pytest.mark.asyncio
+async def test_reused_context_still_enforces_chart_source_validation():
+    # A chart citing anything outside the re-fetched set is discarded, exactly
+    # as for freshly retrieved chunks.
+    store = FakeConversationStore()
+    principal = _principal()
+    conversation_id = await _conversation_after_grounded_answer(store, principal)
+    orchestrator = _make_orchestrator(
+        retrieval=FakeFollowUpRetrievalService(stored=[_finance_chunk()]),
+        provider=FakeChartModelProvider(chart=_revenue_chart(source=("other_report", 3))),
+        conversation_store=store,
+    )
+
+    result = await orchestrator.handle(
+        principal=principal,
+        config=_make_config(),
+        message="Plot a graph of these for me",
+        conversation_id=conversation_id,
+    )
+
+    assert result.grounded is True
+    assert result.chart is None
+
+
+@pytest.mark.asyncio
+async def test_chart_follow_up_with_revoked_access_gets_no_chart_and_honest_guidance():
+    # The previous answer's chunk now needs a label this principal lacks.
+    store = FakeConversationStore()
+    principal = _principal()
+    conversation_id = await _conversation_after_grounded_answer(store, principal)
+    retrieval = FakeFollowUpRetrievalService(
+        stored=[_finance_chunk(labels=frozenset({"dept:finance"}))]
+    )
+    provider = FakeChartModelProvider(
+        reply_text="I need the specific figures to chart.", chart=_revenue_chart()
+    )
+    orchestrator = _make_orchestrator(
+        retrieval=retrieval, provider=provider, conversation_store=store
+    )
+
+    result = await orchestrator.handle(
+        principal=principal,
+        config=_make_config(enabled_tools=["calculate"]),
+        message="Plot a graph of these for me",
+        conversation_id=conversation_id,
+    )
+
+    assert len(retrieval.fetch_calls) == 1
+    prompt = provider.calls[0]
+    assert prompt.retrieved_chunks == ()
+    assert prompt.chart_requested is False
+    assert CHART_WITHOUT_CONTEXT_GUIDANCE in prompt.system_prompt
+    assert CHART_TURN_GUIDANCE not in prompt.system_prompt
+    assert result.chart is None
+    assert result.citations == ()
+
+
+@pytest.mark.asyncio
+async def test_chart_turn_guidance_is_added_only_when_a_chart_is_attempted():
+    # Provider-neutral: fresh chart turns get it, ordinary turns never do.
+    provider = FakeChartModelProvider(chart=_make_chart())
+    orchestrator = _make_orchestrator(
+        retrieval=FakeRetrievalService([_make_chunk()]), provider=provider
+    )
+
+    await orchestrator.handle(principal=_principal(), config=_make_config(), message="chart it")
+    await orchestrator.handle(
+        principal=_principal(), config=_make_config(), message="what was Q2 headcount?"
+    )
+
+    assert CHART_TURN_GUIDANCE in provider.calls[0].system_prompt
+    assert CHART_TURN_GUIDANCE not in provider.calls[1].system_prompt
+
+
+@pytest.mark.asyncio
+async def test_revoked_access_without_tools_still_gets_the_fixed_safe_refusal():
+    store = FakeConversationStore()
+    principal = _principal()
+    conversation_id = await _conversation_after_grounded_answer(store, principal)
+    provider = FakeChartModelProvider(chart=_revenue_chart())
+    orchestrator = _make_orchestrator(
+        retrieval=FakeFollowUpRetrievalService(
+            stored=[_finance_chunk(labels=frozenset({"dept:finance"}))]
+        ),
+        provider=provider,
+        conversation_store=store,
+    )
+
+    result = await orchestrator.handle(
+        principal=principal,
+        config=_make_config(),
+        message="Plot a graph of these for me",
+        conversation_id=conversation_id,
+    )
+
+    assert result.text == NO_AUTHORIZED_CONTEXT_REPLY
+    assert result.chart is None
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled_tools", [[], ["calculate"]])
+async def test_standalone_chart_request_with_no_history_behaves_as_before(enabled_tools):
+    retrieval = FakeFollowUpRetrievalService(stored=[_finance_chunk()])
+    provider = FakeChartModelProvider(chart=_revenue_chart())
+    orchestrator = _make_orchestrator(retrieval=retrieval, provider=provider)
+
+    result = await orchestrator.handle(
+        principal=_principal(),
+        config=_make_config(enabled_tools=enabled_tools),
+        message="Plot a graph of these for me",
+    )
+
+    # A brand-new conversation has no previous answer, so nothing is re-fetched.
+    assert retrieval.fetch_calls == []
+    assert result.chart is None
+    if enabled_tools:
+        assert CHART_WITHOUT_CONTEXT_GUIDANCE in provider.calls[0].system_prompt
+    else:
+        assert result.text == NO_AUTHORIZED_CONTEXT_REPLY
+        assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_non_chart_follow_up_never_reuses_previous_context():
+    store = FakeConversationStore()
+    principal = _principal()
+    conversation_id = await _conversation_after_grounded_answer(store, principal)
+    retrieval = FakeFollowUpRetrievalService(stored=[_finance_chunk()])
+    orchestrator = _make_orchestrator(
+        retrieval=retrieval, provider=FakeChartModelProvider(), conversation_store=store
+    )
+
+    result = await orchestrator.handle(
+        principal=principal,
+        config=_make_config(),
+        message="and what about these?",
+        conversation_id=conversation_id,
+    )
+
+    assert retrieval.fetch_calls == []
+    assert result.text == NO_AUTHORIZED_CONTEXT_REPLY
+
+
+@pytest.mark.asyncio
+async def test_fresh_chunks_take_precedence_over_previous_context():
+    store = FakeConversationStore()
+    principal = _principal()
+    conversation_id = await _conversation_after_grounded_answer(store, principal)
+    fresh = _make_chunk()
+    retrieval = FakeFollowUpRetrievalService(stored=[_finance_chunk()], fresh=[fresh])
+    provider = FakeChartModelProvider(chart=_make_chart())
+    orchestrator = _make_orchestrator(
+        retrieval=retrieval, provider=provider, conversation_store=store
+    )
+
+    result = await orchestrator.handle(
+        principal=principal,
+        config=_make_config(),
+        message="chart the headcount",
+        conversation_id=conversation_id,
+    )
+
+    assert retrieval.fetch_calls == []
+    assert provider.calls[0].retrieved_chunks == (fresh,)
+    assert result.chart is not None
+
+
+@pytest.mark.asyncio
+async def test_only_the_most_recent_answer_is_reused():
+    # The latest answer cited nothing (e.g. it was a refusal); an older
+    # grounded answer must not be reached back to.
+    store = FakeConversationStore()
+    principal = _principal()
+    conversation_id = await _conversation_after_grounded_answer(store, principal)
+    for role, content in [("user", "what is the weather?"), ("assistant", "Not in the documents.")]:
+        await store.append_message(
+            conversation_id=conversation_id, principal=principal, role=role, content=content
+        )
+    retrieval = FakeFollowUpRetrievalService(stored=[_finance_chunk()])
+    provider = FakeChartModelProvider(chart=_revenue_chart())
+    orchestrator = _make_orchestrator(
+        retrieval=retrieval, provider=provider, conversation_store=store
+    )
+
+    result = await orchestrator.handle(
+        principal=principal,
+        config=_make_config(),
+        message="Plot a graph of these for me",
+        conversation_id=conversation_id,
+    )
+
+    assert retrieval.fetch_calls == []
+    assert result.chart is None
+    assert result.text == NO_AUTHORIZED_CONTEXT_REPLY
+
+
+@pytest.mark.asyncio
+async def test_handle_stream_chart_follow_up_reuses_previous_context():
+    store = FakeConversationStore()
+    principal = _principal()
+    conversation_id = await _conversation_after_grounded_answer(store, principal)
+    orchestrator = _make_orchestrator(
+        retrieval=FakeFollowUpRetrievalService(stored=[_finance_chunk()]),
+        provider=FakeChartStreamingModelProvider(
+            deltas=["Here ", "it is."], chart=_revenue_chart()
+        ),
+        conversation_store=store,
+    )
+
+    events = [
+        e
+        async for e in orchestrator.handle_stream(
+            principal=principal,
+            config=_make_config(),
+            message="Plot a graph of these for me",
+            conversation_id=conversation_id,
+        )
+    ]
+
+    charts = [e for e in events if isinstance(e, ChatStreamChart)]
+    assert len(charts) == 1
+    assert charts[0].chart.labels[-1] == "FY2025"
+    assert isinstance(events[-1], ChatStreamDone)

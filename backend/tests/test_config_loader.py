@@ -10,7 +10,7 @@ CONFIGS_DIR = Path(__file__).parent.parent / "configs"
 def test_loads_sample_hr_assistant_config():
     config = load_assistant_config(CONFIGS_DIR / "hr_assistant.yaml")
     assert config.assistant_id == "hr_assistant"
-    assert config.model.provider == "google_adk"
+    assert config.model.provider == "openrouter"
     assert config.retrieval is not None
     assert config.retrieval.collection_name == "hr_policy_docs"
     assert config.enabled_tools == []
@@ -40,12 +40,47 @@ def test_load_all_configs_from_directory():
     assert "hr_assistant" in configs
 
 
-def test_only_gemini_assistants_are_active():
+def test_active_assistants_and_their_providers():
     # configs/examples/ is not scanned (non-recursive glob), so the parked
     # OpenRouter example must not be loaded as a live assistant.
     configs = load_all_assistant_configs(CONFIGS_DIR)
-    assert set(configs) == {"hr_assistant", "finance_assistant"}
-    assert all(c.model.provider == "google_adk" for c in configs.values())
+    assert {aid: c.model.provider for aid, c in configs.items()} == {
+        "hr_assistant": "openrouter",
+        "finance_assistant": "openrouter",
+        "hr_assistant_grok": "xai",
+        "finance_assistant_grok": "xai",
+    }
+
+
+def test_hr_grok_assistant_uses_grok_chat_and_temp_gemini_embeddings():
+    grok = load_assistant_config(CONFIGS_DIR / "hr_assistant_grok.yaml")
+    hr = load_assistant_config(CONFIGS_DIR / "hr_assistant.yaml")
+    assert grok.model.provider == "xai"
+    assert grok.model.model_name == "grok-4.3"
+    assert grok.retrieval is not None and hr.retrieval is not None
+    # TEMP (2026-09-29): Grok configs use Gemini embeddings with their own
+    # measured threshold, to avoid OpenRouter's daily quota. Prompt and
+    # collection still match hr_assistant.
+    assert grok.retrieval.embedding_provider == "gemini"
+    assert grok.retrieval.embedding_model is None
+    assert grok.retrieval.min_similarity == 0.66
+    assert grok.retrieval.collection_name == hr.retrieval.collection_name
+    assert grok.system_prompt == hr.system_prompt
+
+
+def test_finance_grok_assistant_mirrors_finance_assistant_except_chat_model():
+    grok = load_assistant_config(CONFIGS_DIR / "finance_assistant_grok.yaml")
+    finance = load_assistant_config(CONFIGS_DIR / "finance_assistant.yaml")
+    assert grok.model.provider == "xai"
+    assert grok.model.model_name == "grok-4.3"
+    assert grok.retrieval is not None and finance.retrieval is not None
+    # TEMP (2026-09-29): Gemini embeddings, own measured threshold.
+    assert grok.retrieval.embedding_provider == "gemini"
+    assert grok.retrieval.embedding_model is None
+    assert grok.retrieval.min_similarity == 0.645
+    assert grok.retrieval.collection_name == finance.retrieval.collection_name
+    assert grok.system_prompt == finance.system_prompt
+    assert grok.enabled_tools == finance.enabled_tools
 
 
 def test_duplicate_assistant_id_raises(tmp_path):
@@ -73,15 +108,17 @@ system_prompt: You are a test assistant.
 
 
 @pytest.mark.parametrize("assistant_id", ["hr_assistant", "finance_assistant"])
-def test_gemini_assistants_stay_fully_on_gemini(assistant_id):
-    # Guards against these long-verified assistants being moved to another
-    # provider as a side effect of unrelated work (e.g. a missing API key).
+def test_active_assistants_stay_fully_on_openrouter(assistant_id):
+    # Guards against these assistants being moved to another provider as a
+    # side effect of unrelated work (e.g. a missing API key). Switched back
+    # from Gemini to OpenRouter deliberately on 2026-09-30; switching again
+    # means updating this test along with the configs and re-ingesting.
     config = load_assistant_config(CONFIGS_DIR / f"{assistant_id}.yaml")
-    assert config.model.provider == "google_adk"
-    assert config.model.model_name == "gemini-2.5-flash"
+    assert config.model.provider == "openrouter"
+    assert config.model.model_name == "nvidia/nemotron-3-super-120b-a12b:free"
     assert config.retrieval is not None
-    assert config.retrieval.embedding_provider == "gemini"
-    assert config.retrieval.embedding_model is None
+    assert config.retrieval.embedding_provider == "openrouter"
+    assert config.retrieval.embedding_model == "nvidia/nemotron-3-embed-1b:free"
 
 
 def test_parked_openrouter_example_is_fully_on_openrouter():

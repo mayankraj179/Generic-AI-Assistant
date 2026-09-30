@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
+
+from opentelemetry import trace
 
 from app.config.assistant_config import AssistantConfig
 from app.config.settings import Settings
@@ -13,6 +17,16 @@ from app.guardrails import input as input_guardrails
 from app.guardrails import output as output_guardrails
 from app.guardrails import pii
 from app.ingestion.pipeline import Chunk
+from app.observability import audit
+from app.observability.audit import AuditStore, TurnRecorder, record_guardrail
+from app.observability.context import (
+    assistant_id_var,
+    conversation_id_var,
+    principal_ref,
+    principal_ref_var,
+)
+from app.observability.provider_errors import find_failure, log_provider_failure
+from app.observability.tracing import set_attributes, start_span, tracer
 from app.orchestration.errors import (
     AssistantAccessDeniedError,
     InputGuardrailError,
@@ -26,7 +40,13 @@ from app.orchestration.model_provider import (
     ModelProviderError,
 )
 from app.orchestration.provider_factory import get_model_provider
-from app.services.conversation_store import Conversation, ConversationStore, MessageCitation
+from app.services.conversation_store import (
+    Conversation,
+    ConversationNotFoundError,
+    ConversationStore,
+    Message,
+    MessageCitation,
+)
 from app.services.embedding import EmbeddingProvider
 from app.services.embedding_provider_factory import get_embedding_provider
 from app.services.gemini_embedding import GeminiEmbeddingProvider
@@ -57,6 +77,32 @@ NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE = (
     "can directly answer the user's question on its own. If no available "
     "tool applies, say clearly that you don't have enough information to "
     "answer rather than guessing, estimating, or fabricating a response."
+)
+
+# Appended, for every provider, on a turn where a chart will be attempted
+# (chart_requested with document context). Without it a model tends to reply
+# "I cannot plot graphs" right above the chart the application draws from the
+# provider's separate extraction call. Worded so the text still reads
+# correctly if that extraction ends up producing no chart.
+CHART_TURN_GUIDANCE = (
+    "The application renders any chart itself from the figures in the "
+    "retrieved content. Do not say you cannot create, display, or generate "
+    "charts or graphs; answer with the relevant figures from the retrieved "
+    "content."
+)
+
+# Appended, for every provider, when the user asked for a chart but this turn
+# has no document content to build one from (nothing retrieved, and no
+# still-authorized content from the previous answer to reuse). Without it the
+# model tends to claim it "cannot plot graphs", which is false: the
+# application draws charts itself when it has the figures.
+CHART_WITHOUT_CONTEXT_GUIDANCE = (
+    "The user asked for a chart or graph, but no document content is "
+    "available for this request, so no chart can be drawn this time. Do not "
+    "say that you are unable to create charts or graphs in general. Say "
+    "instead that you need the specific figures or topic named in the "
+    "request (for example, which metric and which years) to build a chart "
+    "from the documents."
 )
 
 OUTPUT_GUARDRAIL_FALLBACK_REPLY = (
@@ -218,10 +264,14 @@ class ChatOrchestrator:
         provider_factory: ProviderFactory,
         conversation_store: ConversationStore | None = None,
         embedding_provider_factory: EmbeddingProviderFactory | None = None,
+        audit_store: AuditStore | None = None,
     ) -> None:
         self._retrieval_service = retrieval_service
         self._provider_factory = provider_factory
         self._conversation_store = conversation_store or ConversationStore()
+        # None disables the per-turn audit row (unit tests stay DB-free);
+        # build_default_chat_orchestrator passes the real store.
+        self._audit_store = audit_store
         # None (the default — every existing caller/test that doesn't pass
         # this) preserves the exact prior behavior: RetrievalService.search()
         # falls back to its own construction-time embedder untouched. Only
@@ -229,6 +279,76 @@ class ChatOrchestrator:
         # can opt into a non-Gemini embedding_provider (see
         # app/services/embedding_provider_factory.py).
         self._embedding_provider_factory = embedding_provider_factory
+
+    # --- per-turn observability ------------------------------------------
+
+    def _begin_turn(
+        self,
+        *,
+        operation: str,
+        principal: PrincipalContext,
+        config: AssistantConfig,
+        conversation_id: uuid.UUID | None,
+    ) -> TurnRecorder:
+        """Binds this turn's identifiers and audit recorder to the current
+        context. Deliberately never reset: on the streaming path the rest of
+        the turn runs in a different task, where resetting a token raises."""
+        ref = principal_ref(principal.tenant_id, principal.principal_id)
+        assistant_id_var.set(config.assistant_id)
+        principal_ref_var.set(ref)
+        conversation_id_var.set(str(conversation_id) if conversation_id else None)
+        recorder = TurnRecorder(
+            operation=operation,
+            tenant_id=principal.tenant_id,
+            assistant_id=config.assistant_id,
+            principal_ref=ref,
+            provider=config.model.provider,
+            model_name=config.model.model_name,
+            conversation_id=conversation_id,
+        )
+        audit.bind(recorder)
+        return recorder
+
+    def _note_failure(self, recorder: TurnRecorder, exc: BaseException) -> None:
+        """The single place a failed turn is logged: one classified line for
+        provider failures (traceback at DEBUG), one INFO line for expected
+        rejections, and a full traceback only for genuinely unexpected
+        errors."""
+        if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+            recorder.outcome = "cancelled"
+            logger.info("turn cancelled (client disconnected)", extra={"event": "cancelled"})
+            return
+        failure = find_failure(exc)
+        if failure is not None:
+            recorder.failure, recorder.outcome = failure, "error"
+            log_provider_failure(logger, failure, exc)
+            return
+        expected = {
+            InputGuardrailError: "input_rejected",
+            AssistantAccessDeniedError: "access_denied",
+            ConversationNotFoundError: "conversation_not_found",
+        }
+        for error_type, outcome in expected.items():
+            if isinstance(exc, error_type):
+                recorder.outcome, recorder.error_class = outcome, error_type.__name__
+                logger.info("turn not processed: %s (%s)", outcome, exc, extra={"event": outcome})
+                return
+        recorder.outcome, recorder.error_class = "error", type(exc).__name__
+        if isinstance(exc, RetrievalUnavailableError):
+            cause = exc.__cause__
+            logger.error(
+                "retrieval unavailable: %s: %s", type(cause).__name__, cause,
+                extra={"event": "retrieval_unavailable"},
+            )
+            logger.debug("retrieval failure traceback", exc_info=exc)
+            return
+        logger.exception("unexpected error in chat turn", exc_info=exc)
+
+    async def _end_turn(self, recorder: TurnRecorder) -> None:
+        if self._audit_store is not None:
+            await self._audit_store.write(recorder)
+
+    # --- turns ------------------------------------------------------------
 
     async def handle(
         self,
@@ -238,6 +358,48 @@ class ChatOrchestrator:
         message: str,
         conversation_id: uuid.UUID | None = None,
     ) -> ChatResult:
+        recorder = self._begin_turn(
+            operation="chat", principal=principal, config=config, conversation_id=conversation_id
+        )
+        try:
+            with start_span(
+                "chat.turn",
+                assistant_id=config.assistant_id,
+                provider=config.model.provider,
+                model=config.model.model_name,
+                streaming=False,
+            ) as span:
+                result = await self._handle_turn(
+                    principal=principal,
+                    config=config,
+                    message=message,
+                    conversation_id=conversation_id,
+                )
+                recorder.grounded = result.grounded
+                recorder.citations_count = len(result.citations)
+                recorder.chart_returned = result.chart is not None
+                recorder.conversation_id = result.conversation_id
+                set_attributes(
+                    span,
+                    {"outcome": recorder.outcome, "grounded": result.grounded,
+                     "citations": len(result.citations)},
+                )
+                return result
+        except BaseException as exc:
+            self._note_failure(recorder, exc)
+            raise
+        finally:
+            await self._end_turn(recorder)
+
+    async def _handle_turn(
+        self,
+        *,
+        principal: PrincipalContext,
+        config: AssistantConfig,
+        message: str,
+        conversation_id: uuid.UUID | None,
+    ) -> ChatResult:
+        recorder = audit.current()
         setup = await self._prepare_turn(
             principal=principal,
             config=config,
@@ -256,6 +418,8 @@ class ChatOrchestrator:
                 reply_text=NO_AUTHORIZED_CONTEXT_REPLY,
                 citations=(),
             )
+            if recorder is not None:
+                recorder.outcome = "no_context"
             return ChatResult(
                 text=NO_AUTHORIZED_CONTEXT_REPLY,
                 conversation_id=setup.conversation.id,
@@ -264,7 +428,14 @@ class ChatOrchestrator:
             )
 
         provider = self._provider_factory(config)
-        reply = await provider.generate(setup.prompt)
+        with start_span(
+            "model.generate",
+            provider=config.model.provider,
+            model=config.model.model_name,
+            chart_requested=setup.prompt.chart_requested,
+            tools=list(setup.prompt.enabled_tools),
+        ):
+            reply = await provider.generate(setup.prompt)
 
         guarded = self._apply_output_guardrails(
             config=config,
@@ -272,6 +443,8 @@ class ChatOrchestrator:
             model_grounded=reply.grounded,
             chunks=setup.chunks,
         )
+        if recorder is not None:
+            recorder.outcome = "output_rejected" if guarded.rejected else "answered"
 
         chart = self._validate_chart(
             chart=reply.chart, grounded=guarded.grounded, chunks=setup.chunks
@@ -327,15 +500,73 @@ class ChatOrchestrator:
         fully passed every check — never a partial or rejected one — so a
         cut-off/rejected stream simply leaves no trace of that turn rather
         than risking a reply that looks complete but isn't.
+
+        Observability: the route pulls the first event in the request task
+        and Starlette iterates the rest in another task, so a span entered
+        here and exited after a ``yield`` would detach in the wrong context.
+        The turn span is therefore created unentered and activated with
+        use_span only around awaited sections that contain no ``yield``.
         """
-        setup = await self._prepare_turn(
+        recorder = self._begin_turn(
+            operation="chat_stream",
             principal=principal,
             config=config,
-            message=message,
             conversation_id=conversation_id,
         )
+        turn_span = tracer.start_span(
+            "chat.turn",
+            attributes={
+                "assistant_id": config.assistant_id,
+                "provider": config.model.provider,
+                "model": config.model.model_name,
+                "streaming": True,
+            },
+        )
+        try:
+            async for event in self._handle_stream_turn(
+                principal=principal,
+                config=config,
+                message=message,
+                conversation_id=conversation_id,
+                recorder=recorder,
+                turn_span=turn_span,
+            ):
+                if isinstance(event, ChatStreamDone):
+                    recorder.grounded = event.grounded
+                    recorder.citations_count = len(event.citations)
+                    recorder.conversation_id = event.conversation_id
+                elif isinstance(event, ChatStreamChart):
+                    recorder.chart_returned = True
+                yield event
+        except BaseException as exc:
+            self._note_failure(recorder, exc)
+            turn_span.record_exception(exc)
+            raise
+        finally:
+            set_attributes(turn_span, {"outcome": recorder.outcome, "grounded": recorder.grounded})
+            turn_span.end()
+            await self._end_turn(recorder)
+
+    async def _handle_stream_turn(
+        self,
+        *,
+        principal: PrincipalContext,
+        config: AssistantConfig,
+        message: str,
+        conversation_id: uuid.UUID | None,
+        recorder: TurnRecorder,
+        turn_span: Any,
+    ) -> AsyncIterator[ChatStreamEvent]:
+        with trace.use_span(turn_span, end_on_exit=False):
+            setup = await self._prepare_turn(
+                principal=principal,
+                config=config,
+                message=message,
+                conversation_id=conversation_id,
+            )
 
         if setup.prompt is None:
+            recorder.outcome = "no_context"
             # The safe reply is fully known upfront (never partial), so
             # persisting it before yielding is safe — this isn't the
             # "don't persist partial replies" case at all.
@@ -358,20 +589,43 @@ class ChatOrchestrator:
         final_grounded = False
         final_chart: ChartSpec | None = None
 
+        model_span = tracer.start_span(
+            "model.generate",
+            context=trace.set_span_in_context(turn_span),
+            attributes={
+                "provider": config.model.provider,
+                "model": config.model.model_name,
+                "chart_requested": setup.prompt.chart_requested,
+                "streaming": True,
+            },
+        )
+        stream = provider.generate_stream(setup.prompt)
         try:
-            async for stream_event in provider.generate_stream(setup.prompt):
+            while True:
+                with trace.use_span(model_span, end_on_exit=False):
+                    try:
+                        stream_event = await stream.__anext__()
+                    except StopAsyncIteration:
+                        break
                 if stream_event.is_final:
                     final_text = stream_event.text
                     final_grounded = stream_event.grounded
                     final_chart = stream_event.chart
                 elif stream_event.delta:
                     yield ChatStreamDelta(text=stream_event.delta)
-        except ModelProviderError:
-            # Nothing persisted — see the persistence policy above.
+        except ModelProviderError as exc:
+            # Nothing persisted — see the persistence policy above. The
+            # failure is logged and audited here because it never reaches
+            # the route: it becomes an in-band error event instead.
+            self._note_failure(recorder, exc)
+            model_span.record_exception(exc)
             yield ChatStreamError(detail="the assistant model is temporarily unavailable")
             return
+        finally:
+            model_span.end()
 
         if final_text is None:
+            recorder.outcome, recorder.error_class = "error", "EmptyStream"
             yield ChatStreamError(detail="the assistant model is temporarily unavailable")
             return
 
@@ -383,8 +637,10 @@ class ChatOrchestrator:
         )
 
         if guarded.rejected:
+            recorder.outcome = "output_rejected"
             yield ChatStreamError(detail="the assistant's response could not be delivered")
             return
+        recorder.outcome = "answered"
 
         chart = self._validate_chart(
             chart=final_chart, grounded=guarded.grounded, chunks=setup.chunks
@@ -444,6 +700,11 @@ class ChatOrchestrator:
                 config.assistant_id,
                 input_pii_hits,
             )
+            record_guardrail(
+                "input_pii",
+                patterns=list(input_pii_hits),
+                blocked=config.guardrails.input_pii_block,
+            )
             if config.guardrails.input_pii_block:
                 raise InputGuardrailError(
                     "message appears to contain personal information and cannot be processed"
@@ -472,12 +733,18 @@ class ChatOrchestrator:
             )
             prior_messages = []
 
+        conversation_id_var.set(str(conversation.id))
+        recorder = audit.current()
+        if recorder is not None:
+            recorder.conversation_id = conversation.id
+
         prior_turns = tuple(
             ConversationTurn(role=m.role, content=m.content) for m in prior_messages
         )
 
         retrieval_enabled = config.retrieval is not None and config.retrieval.enabled
         chunks: list[Chunk] = []
+        chart_trigger_matched = _message_requests_chart(message, config.chart_trigger_patterns)
 
         if retrieval_enabled:
             assert config.retrieval is not None
@@ -499,6 +766,16 @@ class ChatOrchestrator:
                 raise RetrievalUnavailableError("retrieval backend is unavailable") from exc
 
             chunks = input_guardrails.screen_retrieved_chunks(raw_chunks)
+            if len(chunks) < len(raw_chunks):
+                record_guardrail("chunk_injection_dropped", dropped=len(raw_chunks) - len(chunks))
+
+            if not chunks and chart_trigger_matched:
+                # A follow-up like "plot a graph of these" names no topic, so
+                # its own retrieval finds nothing. Reuse what the previous
+                # answer was grounded on, re-checked against current access.
+                chunks = await self._reuse_previous_answer_context(
+                    prior_messages=prior_messages, principal=principal, config=config
+                )
 
             if not chunks and not config.enabled_tools:
                 # No relevant/authorized document content AND no tools that
@@ -515,7 +792,7 @@ class ChatOrchestrator:
 
         if chunks:
             user_turn = build_grounded_user_turn(user_question=message, retrieved_chunks=chunks)
-            chart_requested = _message_requests_chart(message, config.chart_trigger_patterns)
+            chart_requested = chart_trigger_matched
         else:
             # Either retrieval is off, or it ran and found nothing relevant/
             # authorized but this assistant has tools configured (see the
@@ -533,6 +810,10 @@ class ChatOrchestrator:
             # and to decline on its own if no available tool actually
             # applies to this question either.
             system_prompt = f"{system_prompt}\n\n{NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE}"
+            if chart_trigger_matched:
+                system_prompt = f"{system_prompt}\n\n{CHART_WITHOUT_CONTEXT_GUIDANCE}"
+        if chart_requested:
+            system_prompt = f"{system_prompt}\n\n{CHART_TURN_GUIDANCE}"
 
         prompt = GroundedPrompt(
             system_prompt=system_prompt,
@@ -544,6 +825,47 @@ class ChatOrchestrator:
             max_tool_calls=config.max_tool_calls,
         )
         return _PreparedTurn(conversation=conversation, prompt=prompt, chunks=tuple(chunks))
+
+    async def _reuse_previous_answer_context(
+        self,
+        *,
+        prior_messages: Sequence[Message],
+        principal: PrincipalContext,
+        config: AssistantConfig,
+    ) -> list[Chunk]:
+        """Chunks the most recent assistant turn cited, re-fetched and
+        re-authorized for this principal now, then screened like fresh
+        retrieval. Only that one turn is considered: an older answer is not a
+        safe guess for what "these" refers to. Returns [] when there is no
+        such turn, it cited nothing, or nothing it cited is still readable."""
+        previous_answer = next((m for m in reversed(prior_messages) if m.role == "assistant"), None)
+        if previous_answer is None or not previous_answer.citations:
+            return []
+
+        citations = [(c.document_title, c.chunk_index) for c in previous_answer.citations]
+        try:
+            refetched = await self._retrieval_service.fetch_cited_chunks(
+                citations=citations, principal=principal, assistant_id=config.assistant_id
+            )
+        except Exception as exc:  # never leak DB/connection details upward
+            raise RetrievalUnavailableError("retrieval backend is unavailable") from exc
+
+        chunks = input_guardrails.screen_retrieved_chunks(refetched)
+        if len(chunks) < len(refetched):
+            record_guardrail("chunk_injection_dropped", dropped=len(refetched) - len(chunks))
+        recorder = audit.current()
+        if recorder is not None:
+            recorder.retrieval["reused_previous_answer"] = {
+                "cited": len(citations),
+                "reused": len(chunks),
+            }
+        logger.info(
+            "chart follow-up for '%s': reused %d of %d chunks cited by the previous answer",
+            config.assistant_id,
+            len(chunks),
+            len(citations),
+        )
+        return chunks
 
     def _apply_output_guardrails(
         self,
@@ -574,6 +896,11 @@ class ChatOrchestrator:
         if grounded and output_guardrails.reply_appears_to_refuse(text):
             grounded = False
             cite_chunks = ()
+            record_guardrail("citation_downgrade", reason="reply_appears_to_refuse")
+            logger.info(
+                "output guardrail: reply reads as a refusal; grounded=false, citations dropped",
+                extra={"event": "citation_downgrade"},
+            )
 
         output_pii_hits = pii.detect_pii(text)
         if output_pii_hits:
@@ -581,6 +908,11 @@ class ChatOrchestrator:
                 "model output for assistant '%s' matched PII pattern(s): %s",
                 config.assistant_id,
                 output_pii_hits,
+            )
+            record_guardrail(
+                "output_pii",
+                patterns=list(output_pii_hits),
+                blocked=config.guardrails.output_pii_block,
             )
             if config.guardrails.output_pii_block:
                 return _GuardedOutput(
@@ -597,6 +929,7 @@ class ChatOrchestrator:
                 "model output for assistant '%s' matched a configured unsafe-content pattern",
                 config.assistant_id,
             )
+            record_guardrail("unsafe_output", blocked=True)
             return _GuardedOutput(
                 text=OUTPUT_GUARDRAIL_FALLBACK_REPLY, grounded=False, citations=(), rejected=True
             )
@@ -694,6 +1027,7 @@ def build_default_chat_orchestrator(*, settings: Settings) -> ChatOrchestrator:
         return get_embedding_provider(config=config, settings=settings)
 
     return ChatOrchestrator(
+        audit_store=AuditStore(),
         retrieval_service=retrieval_service,
         provider_factory=provider_factory,
         embedding_provider_factory=embedding_provider_factory,

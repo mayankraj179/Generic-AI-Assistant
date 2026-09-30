@@ -21,3 +21,6 @@ frontend/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Real company documents — never commit
+backend/test-documents/*.md

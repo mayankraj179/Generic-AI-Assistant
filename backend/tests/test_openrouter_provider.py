@@ -5,6 +5,7 @@ import json
 import httpx
 import pytest
 
+from app.ingestion.pipeline import Chunk
 from app.orchestration.model_provider import ConversationTurn, GroundedPrompt, ModelProviderError
 from app.orchestration.openrouter_provider import OpenRouterProvider
 
@@ -137,7 +138,9 @@ async def test_generate_is_grounded_only_when_chunks_present(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_generate_never_returns_a_chart(monkeypatch: pytest.MonkeyPatch):
+async def test_generate_returns_no_chart_when_requested_but_nothing_retrieved(
+    monkeypatch: pytest.MonkeyPatch,
+):
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response(200, {"choices": [{"message": {"content": "Answer."}}]})
 
@@ -489,3 +492,169 @@ async def test_generate_without_enabled_tools_never_sends_tools_field(
 
     reply = await provider.generate(_prompt())  # enabled_tools defaults to ()
     assert reply.text == "no tools here"
+
+
+# ---------------------------------------------------------------------------
+# Chart generation via structured outputs
+# ---------------------------------------------------------------------------
+
+
+def _finance_chunk() -> Chunk:
+    text = "FY2021 42.3 | FY2022 51.8 | FY2023 63.4 | FY2024 79.1 | FY2025 96.5"
+    return Chunk(
+        document_title="nova_horizon_fy2025",
+        chunk_index=0,
+        display_text=text,
+        embedded_text=f"nova_horizon_fy2025: {text}",
+        access_labels=frozenset({"role:authenticated"}),
+    )
+
+
+_REVENUE_CHART = {
+    "chart": {
+        "chart_type": "line",
+        "title": "Revenue FY2021-FY2025",
+        "labels": ["FY2021", "FY2022", "FY2023", "FY2024", "FY2025"],
+        "series": [{"name": "Revenue ($M)", "values": [42.3, 51.8, 63.4, 79.1, 96.5]}],
+        "source_chunks": [{"document_title": "nova_horizon_fy2025", "chunk_index": 0}],
+    }
+}
+
+
+def _sequenced_raw_handler(responses: list[tuple[int, dict]]):
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status, body = responses[calls["count"]]
+        calls["count"] += 1
+        return _json_response(status, body)
+
+    return handler, calls
+
+
+def _answer(text: str) -> tuple[int, dict]:
+    return 200, {"choices": [{"message": {"role": "assistant", "content": text}}]}
+
+
+@pytest.mark.asyncio
+async def test_no_chart_call_and_no_chart_guidance_when_chart_not_requested(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    handler, calls = _sequenced_raw_handler([_answer("Revenue was $96.5M.")])
+    captured = _install_transport(monkeypatch, handler)
+    provider = OpenRouterProvider(model_name="m", api_key="test-key")
+
+    reply = await provider.generate(_prompt(retrieved_chunks=(_finance_chunk(),)))
+
+    assert reply.chart is None
+    assert calls["count"] == 1
+    body = json.loads(captured[0].content)
+    assert "renders any chart itself" not in body["messages"][0]["content"]
+    assert "response_format" not in body and "provider" not in body
+
+
+@pytest.mark.asyncio
+async def test_chart_turn_makes_strict_schema_call_that_requires_supporting_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    handler, calls = _sequenced_raw_handler(
+        [_answer("Revenue grew from 42.3 to 96.5."), _answer(json.dumps(_REVENUE_CHART))]
+    )
+    captured = _install_transport(monkeypatch, handler)
+    provider = OpenRouterProvider(model_name="m", api_key="test-key")
+
+    reply = await provider.generate(
+        _prompt(retrieved_chunks=(_finance_chunk(),), chart_requested=True)
+    )
+
+    assert calls["count"] == 2
+    answer_body = json.loads(captured[0].content)
+    # Chart-turn wording guidance is the orchestrator's job for every
+    # provider; this provider passes the system prompt through unchanged.
+    assert answer_body["messages"][0]["content"] == "You are a helpful assistant."
+    assert "response_format" not in answer_body
+
+    chart_body = json.loads(captured[1].content)
+    assert chart_body["provider"] == {"require_parameters": True}
+    assert chart_body["response_format"]["type"] == "json_schema"
+    assert chart_body["response_format"]["json_schema"]["strict"] is True
+    assert "[source: nova_horizon_fy2025, chunk 0]" in chart_body["messages"][-1]["content"]
+    assert "tools" not in chart_body
+
+    assert reply.text == "Revenue grew from 42.3 to 96.5."
+    assert reply.chart is not None
+    assert reply.chart.chart_type == "line"
+    assert reply.chart.series[0].values == [42.3, 51.8, 63.4, 79.1, 96.5]
+    assert reply.chart.source_chunks[0].document_title == "nova_horizon_fy2025"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "chart_response",
+    [
+        (404, {"error": {"message": "No endpoints found that support the requested parameters"}}),
+        (200, {"id": "gen-1", "error": {"message": "Upstream error: overloaded", "code": 503}}),
+        _answer("Sure! Here's your chart: revenue went up."),
+        _answer(json.dumps({"chart": {"chart_type": "radar"}})),
+        _answer(json.dumps({"chart": None})),
+        _answer(
+            json.dumps(
+                {
+                    "chart": {
+                        **_REVENUE_CHART["chart"],
+                        "chart_type": "pie",
+                        "series": [{"name": "a", "values": [1]}, {"name": "b", "values": [2]}],
+                    }
+                }
+            )
+        ),
+    ],
+    ids=["no-supporting-endpoint", "200-embedded-error", "free-text", "schema-invalid",
+         "null", "bad-pie"],
+)
+async def test_any_chart_failure_yields_no_chart_and_keeps_the_text_answer(
+    monkeypatch: pytest.MonkeyPatch, chart_response
+):
+    handler, _ = _sequenced_raw_handler([_answer("Revenue was $96.5M."), chart_response])
+    _install_transport(monkeypatch, handler)
+    provider = OpenRouterProvider(model_name="m", api_key="test-key")
+
+    reply = await provider.generate(
+        _prompt(retrieved_chunks=(_finance_chunk(),), chart_requested=True)
+    )
+
+    assert reply.text == "Revenue was $96.5M."
+    assert reply.chart is None
+
+
+@pytest.mark.asyncio
+async def test_generate_stream_final_event_carries_the_chart(monkeypatch: pytest.MonkeyPatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("stream"):
+            return _sse_response(
+                200,
+                [
+                    'data: {"choices":[{"delta":{"content":"Revenue "}}]}',
+                    'data: {"choices":[{"delta":{"content":"rose."}}]}',
+                    "data: [DONE]",
+                ],
+            )
+        chart_message = {"message": {"content": json.dumps(_REVENUE_CHART)}}
+        return _json_response(200, {"choices": [chart_message]})
+
+    _install_transport(monkeypatch, handler)
+    provider = OpenRouterProvider(model_name="m", api_key="test-key")
+
+    events = [
+        e
+        async for e in provider.generate_stream(
+            _prompt(retrieved_chunks=(_finance_chunk(),), chart_requested=True)
+        )
+    ]
+
+    assert [e.delta for e in events if not e.is_final] == ["Revenue ", "rose."]
+    assert events[-1].is_final
+    assert events[-1].text == "Revenue rose."
+    assert events[-1].chart is not None
+    assert events[-1].chart.labels[-1] == "FY2025"

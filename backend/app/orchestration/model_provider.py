@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from app.ingestion.pipeline import Chunk
 
@@ -150,8 +150,14 @@ class ModelProviderError(Exception):
     """Raised when a model provider is misconfigured or a model call fails.
 
     Callers must treat the message as internal detail — never forward it
-    verbatim into an HTTP response.
+    verbatim into an HTTP response. ``failure``, when set, is the structured
+    classification (app.observability.provider_errors) used for logging and
+    audit.
     """
+
+    def __init__(self, message: str = "", *, failure: Any = None) -> None:
+        super().__init__(message)
+        self.failure = failure
 
 
 class ModelProvider(Protocol):

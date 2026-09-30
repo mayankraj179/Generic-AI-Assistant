@@ -1,19 +1,17 @@
-assistant_id: hr_assistant
-display_name: HR Policy Assistant
-description: Answers employee questions about HR policy using RAG over policy documents.
+assistant_id: hr_assistant_grok
+display_name: HR Policy Assistant (Grok)
+description: Same HR corpus and prompt as hr_assistant, answered by xAI Grok, for side-by-side comparison with the Nemotron-backed hr_assistant.
 tenant_id: bitwise-global
 
 model:
-  # Back on OpenRouter (2026-09-30): its daily free quota reset, and Gemini's
-  # smaller generation cap is kept for chart and Grok-comparison testing. To
-  # use Gemini instead: provider gemini, model_name gemini-2.5-flash,
-  # embedding_provider gemini (no embedding_model), min_similarity 0.66 (hr) /
-  # 0.645 (finance), then re-ingest (a model change always makes a new
-  # generation; it never reactivates an old one).
-  provider: openrouter
-  model_name: nvidia/nemotron-3-super-120b-a12b:free
+  # xAI directly (GrokProvider), not via OpenRouter. grok-4.3 is the cheapest
+  # current general model in docs.x.ai/developers/models ($1.25/$2.50 per 1M).
+  provider: xai
+  model_name: grok-4.3
   supports_tools: true
-  supports_streaming: true
+  # GrokProvider.generate_stream() is not built yet. Nothing enforces this
+  # flag, so /chat/stream would return an in-band error event for now.
+  supports_streaming: false
   thinking_level: null
   configurable_thinking: false
   max_context_tokens: 128000
@@ -23,17 +21,18 @@ retrieval:
   collection_name: hr_policy_docs
   exact_search_threshold: 500
   top_k: 8
-  # nvidia/nemotron-3-embed-1b:free, measured 2026-09-29 against this
-  # corpus: relevant top-1 0.2984-0.6446 (n=15, correct document first every
-  # time; bare date lookups like "is 2nd October a holiday?" 0.2984 and "is
-  # 14th September a holiday?" 0.3090 are the weakest). Unrelated/off-domain
-  # top-1 max 0.1784 (n=11). 0.24 sits mid-gap with ~0.06 margin each side.
-  # (Gemini embeddings use 0.66; see the model comment above.)
-  min_similarity: 0.24
-  # Explicit rather than relying on RetrievalConfig's default, so the
-  # provider can never change as a side effect of a default change.
-  embedding_provider: openrouter
-  embedding_model: nvidia/nemotron-3-embed-1b:free
+  # TEMP, measured 2026-09-29 against this assistant's gemini-embedding-001
+  # chunks (travel_policy, bitwise_leave_policy, holidays_2026). Relevant top-1
+  # 0.6906-0.7709 (n=10, correct document first every time, date lookups
+  # included). Unrelated/off-domain top-1 up to 0.6244 (n=11; everyday
+  # HR-adjacent questions like "office cafeteria" score 0.59-0.62). 0.66 is
+  # mid-gap, but the gap is only ~0.066 (about +/-0.03 margin).
+  min_similarity: 0.66
+  # TEMP (2026-09-29): Gemini embeddings (gemini-embedding-001, the provider
+  # default) so this Grok assistant isn't blocked by OpenRouter's daily
+  # free-model quota. Temporary testing choice, not a decision: revisit the
+  # embedding provider for all Grok configs later.
+  embedding_provider: gemini
 
 named_queries:
   - name: employee_leave_balance

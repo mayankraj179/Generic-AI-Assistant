@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -28,6 +29,11 @@ from app.config.loader import load_all_assistant_configs
 from app.config.settings import Settings
 from app.core.principal import PrincipalContext
 from app.ingestion.pipeline import ParseError
+from app.observability.context import new_request_id, request_id_var
+from app.observability.logging_setup import configure_logging
+from app.observability.provider_errors import find_failure, log_provider_failure
+from app.observability.tracing import configure_tracing, start_span
+from app.observability.usage import usage_summary
 from app.orchestration.chat_service import (
     ChatOrchestrator,
     ChatStreamChart,
@@ -48,11 +54,38 @@ from app.services.embedding import EmbeddingProviderError
 from app.services.embedding_provider_factory import get_embedding_provider
 from app.services.ingestion_service import IngestionService
 
+configure_logging()
+configure_tracing()
 logger = logging.getLogger(__name__)
 
 settings = Settings()
 
 app = FastAPI(title="Generic AI Assistant Framework", version="0.1.0")
+
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    """Assigns the request id every log line and audit row carries (a
+    well-formed incoming X-Request-ID is kept so a caller can correlate), and
+    opens the request's root span. google-adk's own spans nest under it."""
+    incoming = request.headers.get("X-Request-ID", "")
+    request_id = incoming if _REQUEST_ID_RE.fullmatch(incoming) else new_request_id()
+    request_id_var.set(request_id)
+    with start_span(
+        f"{request.method} {request.url.path}",
+        **{
+            "http.method": request.method,
+            "http.target": request.url.path,
+            "request_id": request_id,
+        },
+    ) as span:
+        response = await call_next(request)
+        span.set_attribute("http.status_code", response.status_code)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 app.state.settings = settings
 app.state.auth_provider = JwtAuthProvider(settings=settings)
 app.state.chat_orchestrator = build_default_chat_orchestrator(settings=settings)
@@ -150,13 +183,13 @@ async def chat(
             detail="conversation not found",
         ) from None
     except RetrievalUnavailableError as exc:
-        logger.exception("retrieval failed for assistant '%s'", config.assistant_id)
+        # Already logged once, classified, by ChatOrchestrator.
         raise HTTPException(
             status_code=503,
             detail="retrieval is temporarily unavailable",
         ) from exc
     except ModelProviderError as exc:
-        logger.exception("model provider failed for assistant '%s'", config.assistant_id)
+        # Already logged once, classified, by ChatOrchestrator.
         raise HTTPException(
             status_code=503,
             detail="the assistant model is temporarily unavailable",
@@ -270,7 +303,7 @@ async def chat_stream(
             detail="conversation not found",
         ) from None
     except RetrievalUnavailableError as exc:
-        logger.exception("retrieval failed for assistant '%s'", config.assistant_id)
+        # Already logged once, classified, by ChatOrchestrator.
         raise HTTPException(
             status_code=503,
             detail="retrieval is temporarily unavailable",
@@ -376,10 +409,43 @@ async def admin_ingest(
     except ParseError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except EmbeddingProviderError as exc:
-        logger.exception("embedding failed while ingesting '%s'", request.source_path)
+        failure = find_failure(exc)
+        if failure is not None:
+            log_provider_failure(logger, failure, exc)
+        else:
+            logger.error("embedding failed while ingesting '%s': %s", request.source_path, exc)
         raise HTTPException(
             status_code=503,
             detail="the embedding provider is temporarily unavailable",
         ) from exc
 
     return AdminIngestResponse(source_uri=request.source_path, chunks_ingested=len(chunks))
+
+
+@app.get("/admin/usage")
+async def admin_usage(
+    principal: Annotated[PrincipalContext, Depends(require_permission("admin:ingest"))],
+) -> dict:
+    """Rough provider-quota usage in each provider's current window, from the
+    turn audit (see app/observability/usage.py for what it does and doesn't
+    count). Uses admin:ingest, the only admin permission the policy defines."""
+    del principal
+    lines = await usage_summary()
+    return {
+        "note": "chat turns only (ingestion/scripts not audited): a lower bound",
+        "usage": [
+            {
+                "provider": u.provider,
+                "kind": u.kind,
+                "model": u.model,
+                "calls": u.calls,
+                "prompt_tokens": u.prompt_tokens,
+                "completion_tokens": u.completion_tokens,
+                "limit": u.limit,
+                "limit_source": u.limit_source,
+                "window_start": u.window_start.isoformat(),
+                "last_quota_error": u.last_quota_error,
+            }
+            for u in lines
+        ],
+    }

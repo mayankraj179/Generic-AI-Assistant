@@ -5,6 +5,8 @@ from typing import Any
 
 import httpx
 
+from app.observability.audit import record_provider_call
+from app.observability.provider_errors import classify_exception, classify_http
 from app.services.embedding import EmbeddingProviderError
 
 # "google/gemini-embedding-001" via OpenRouter's /embeddings endpoint —
@@ -54,7 +56,7 @@ def _parse_json_body(raw: bytes) -> Any:
         return None
 
 
-def _raise_for_error(status_code: int, body: Any) -> None:
+def _raise_for_error(status_code: int, body: Any, *, model: str | None = None) -> None:
     """Same documented OpenRouter error shape as openrouter_provider.py's
     _raise_for_error — kept as a separate copy rather than a shared import:
     this module and openrouter_provider.py are each meant to be the single
@@ -62,7 +64,9 @@ def _raise_for_error(status_code: int, body: Any) -> None:
     and gemini_provider.py don't share code either), and the function is
     three lines.
     """
-    if status_code < 400:
+    # An error body is an error under any status (OpenRouter can wrap an
+    # upstream failure in HTTP 200).
+    if status_code < 400 and not (isinstance(body, dict) and body.get("error") is not None):
         return
     detail: str | None = None
     if isinstance(body, dict):
@@ -72,7 +76,12 @@ def _raise_for_error(status_code: int, body: Any) -> None:
             if isinstance(message, str) and message:
                 detail = message
     suffix = f": {detail}" if detail else ""
-    raise EmbeddingProviderError(f"OpenRouter returned an error (status={status_code}){suffix}")
+    raise EmbeddingProviderError(
+        f"OpenRouter returned an error (status={status_code}){suffix}",
+        failure=classify_http(
+            provider="openrouter", status=status_code, body=body, operation="embedding", model=model
+        ),
+    )
 
 
 class OpenRouterEmbeddingProvider:
@@ -141,16 +150,22 @@ class OpenRouterEmbeddingProvider:
             "input": texts,
             "input_type": input_type,
         }
+        record_provider_call("embedding", "openrouter", self._model_name)
         try:
             async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
                 response = await client.post(_EMBEDDINGS_URL, headers=self._headers(), json=payload)
         except EmbeddingProviderError:
             raise
         except Exception as exc:  # network/timeout/TLS failures from httpx
-            raise EmbeddingProviderError("OpenRouter embedding request failed") from exc
+            raise EmbeddingProviderError(
+                "OpenRouter embedding request failed",
+                failure=classify_exception(
+                    exc, provider="openrouter", operation="embedding", model=self._model_name
+                ),
+            ) from exc
 
         body = _parse_json_body(response.content)
-        _raise_for_error(response.status_code, body)
+        _raise_for_error(response.status_code, body, model=self._model_name)
 
         try:
             items = sorted(body["data"], key=lambda item: item["index"])

@@ -50,6 +50,9 @@ dev = [
     "ruff>=0.6.9",
     "mypy>=1.11.2",
 ]
+# Only needed to export traces (OTEL_TRACES_EXPORTER=otlp, e.g. to local
+# Jaeger). Pinned to the opentelemetry-api/sdk version google-adk installs.
+tracing = ["opentelemetry-exporter-otlp-proto-http==1.42.1"]
 
 [tool.ruff]
 line-length = 100
