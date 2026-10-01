@@ -10,7 +10,7 @@ CONFIGS_DIR = Path(__file__).parent.parent / "configs"
 def test_loads_sample_hr_assistant_config():
     config = load_assistant_config(CONFIGS_DIR / "hr_assistant.yaml")
     assert config.assistant_id == "hr_assistant"
-    assert config.model.provider == "openrouter"
+    assert config.model.provider == "azure_ai"
     assert config.retrieval is not None
     assert config.retrieval.collection_name == "hr_policy_docs"
     assert config.enabled_tools == []
@@ -45,11 +45,25 @@ def test_active_assistants_and_their_providers():
     # OpenRouter example must not be loaded as a live assistant.
     configs = load_all_assistant_configs(CONFIGS_DIR)
     assert {aid: c.model.provider for aid, c in configs.items()} == {
-        "hr_assistant": "openrouter",
-        "finance_assistant": "openrouter",
+        "hr_assistant": "azure_ai",
+        "finance_assistant": "azure_ai",
         "hr_assistant_grok": "xai",
         "finance_assistant_grok": "xai",
+        "hr_assistant_azure": "azure_ai",
     }
+
+
+def test_azure_testing_config_is_marked_temp_and_mirrors_hr_assistant():
+    azure = load_assistant_config(CONFIGS_DIR / "hr_assistant_azure.yaml")
+    hr = load_assistant_config(CONFIGS_DIR / "hr_assistant.yaml")
+    assert azure.model.provider == "azure_ai"
+    assert azure.model.model_name == "gpt-6-luna"
+    assert "TEMP" in azure.display_name
+    assert azure.system_prompt == hr.system_prompt
+    # TEMP Gemini embeddings, same as the Grok testing configs.
+    assert azure.retrieval is not None
+    assert azure.retrieval.embedding_provider == "gemini"
+    assert azure.retrieval.min_similarity == 0.66
 
 
 def test_hr_grok_assistant_uses_grok_chat_and_temp_gemini_embeddings():
@@ -108,17 +122,17 @@ system_prompt: You are a test assistant.
 
 
 @pytest.mark.parametrize("assistant_id", ["hr_assistant", "finance_assistant"])
-def test_active_assistants_stay_fully_on_openrouter(assistant_id):
+def test_active_assistants_are_on_temp_azure_chat_and_gemini_embeddings(assistant_id):
     # Guards against these assistants being moved to another provider as a
-    # side effect of unrelated work (e.g. a missing API key). Switched back
-    # from Gemini to OpenRouter deliberately on 2026-09-30; switching again
-    # means updating this test along with the configs and re-ingesting.
+    # side effect of unrelated work (e.g. a missing API key). TEMP (2026-09-30,
+    # testing): Azure AI chat + Gemini embeddings; switching again means
+    # updating this test along with the configs and re-ingesting.
     config = load_assistant_config(CONFIGS_DIR / f"{assistant_id}.yaml")
-    assert config.model.provider == "openrouter"
-    assert config.model.model_name == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert config.model.provider == "azure_ai"
+    assert config.model.model_name == "gpt-6-luna"
     assert config.retrieval is not None
-    assert config.retrieval.embedding_provider == "openrouter"
-    assert config.retrieval.embedding_model == "nvidia/nemotron-3-embed-1b:free"
+    assert config.retrieval.embedding_provider == "gemini"
+    assert config.retrieval.embedding_model is None
 
 
 def test_parked_openrouter_example_is_fully_on_openrouter():

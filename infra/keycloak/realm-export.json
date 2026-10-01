@@ -2,6 +2,7 @@
   "realm": "generic-ai-dev",
   "enabled": true,
   "displayName": "Generic AI Development",
+  "accessTokenLifespan": 3600,
   "clients": [
     {
       "clientId": "generic-ai-api",

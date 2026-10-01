@@ -74,6 +74,22 @@ class Settings(BaseSettings):
             "xai_api_key",
         ),
     )
+    # TEMP: Azure AI Foundry, added for testing (2026-09-30).
+    azure_ai_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "AZURE_AI_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+            "azure_ai_api_key",
+        ),
+    )
+    azure_ai_endpoint: str = Field(
+        default="https://hrinitiatives.services.ai.azure.com/openai/v1",
+        validation_alias=AliasChoices(
+            "AZURE_AI_ENDPOINT",
+            "azure_ai_endpoint",
+        ),
+    )
 
     @field_validator("development_permission_set", mode="before")
     @classmethod

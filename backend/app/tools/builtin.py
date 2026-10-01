@@ -316,5 +316,10 @@ async def execute_tool(name: str, arguments: dict) -> dict:
             result = {"error": f"invalid arguments for '{name}': {exc}"}
         error = result.get("error") if isinstance(result, dict) else None
         span.set_attribute("tool.ok", error is None)
-        record_tool_call(name, ok=error is None, error=str(error) if error else None)
+        record_tool_call(
+            name,
+            ok=error is None,
+            error=str(error) if error else None,
+            result=result if isinstance(result, dict) else None,
+        )
         return result

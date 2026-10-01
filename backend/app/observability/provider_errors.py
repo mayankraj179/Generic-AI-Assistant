@@ -34,6 +34,7 @@ _KEY_ENV_VARS = {
     "gemini": "GEMINI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
     "xai": "XAI_API_KEY",
+    "azure_ai": "AZURE_AI_API_KEY",
 }
 
 
@@ -188,6 +189,7 @@ def classify_google(
 
 # --- OpenAI-shaped HTTP APIs (OpenRouter, xAI) -----------------------------
 
+_RETRY_AFTER_RE = re.compile(r"retry after\s*(?P<seconds>\d+)\s*second", re.IGNORECASE)
 _OPENROUTER_LIMIT_RE = re.compile(r"Rate limit exceeded:\s*(?P<name>[\w\-]+)", re.IGNORECASE)
 
 
@@ -207,9 +209,18 @@ def classify_http(
     # xAI's shape is {"code": "invalid-argument", "error": "..."}.
     if isinstance(body, dict) and isinstance(body.get("code"), str) and not message:
         message = body["code"]
+    # Azure sends numeric codes as strings ({"code": "401"}, seen live).
+    if isinstance(embedded, str) and embedded.isdigit():
+        embedded = int(embedded)
     effective = embedded if (status < 400 and isinstance(embedded, int)) else status
     common = dict(provider=provider, operation=operation, model=model, status=effective)
     lowered = message.lower()
+
+    # Azure's content filter rejects a prompt with code "content_filter".
+    if embedded == "content_filter":
+        return ProviderFailure(
+            kind=ErrorKind.BAD_REQUEST, message=_short(f"content filter: {message}"), **common
+        )
 
     if metadata.get("error_type") == "provider_overloaded" or effective in (503, 529):
         return ProviderFailure(kind=ErrorKind.OVERLOADED, message=_short(message), **common)
@@ -225,12 +236,14 @@ def classify_http(
             if reset_ms and str(reset_ms).isdigit()
             else None
         )
+        retry = _RETRY_AFTER_RE.search(message)  # Azure: "Please retry after 22 seconds."
         return ProviderFailure(
             kind=ErrorKind.QUOTA_EXCEEDED if daily else ErrorKind.RATE_LIMITED,
             quota=name,
             limit=int(limit) if limit and str(limit).isdigit() else None,
             window="per-day" if daily else None,
             resets_at=resets_at,
+            retry_after_s=float(retry["seconds"]) if retry else None,
             message=_short(message),
             **common,
         )

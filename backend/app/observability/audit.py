@@ -38,6 +38,10 @@ class TurnRecorder:
     retrieval: dict[str, Any] = field(default_factory=dict)
     chart_returned: bool = False
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Successful tool outputs, for ChatOrchestrator._require_tool_result.
+    # Never part of the audit row: a tool result can carry data the audit
+    # table has no business keeping.
+    tool_results: list[dict[str, Any]] = field(default_factory=list)
     guardrail_actions: list[dict[str, Any]] = field(default_factory=list)
     provider_calls: dict[tuple[str, str, str], dict[str, Any]] = field(default_factory=dict)
     failure: ProviderFailure | None = None
@@ -154,13 +158,17 @@ def record_retrieval(**stats: Any) -> None:
         recorder.embedding_model = stats.get("embedding_model") or recorder.embedding_model
 
 
-def record_tool_call(name: str, ok: bool, error: str | None = None) -> None:
+def record_tool_call(
+    name: str, ok: bool, error: str | None = None, result: dict[str, Any] | None = None
+) -> None:
     recorder = _current.get()
     if recorder is not None:
         entry: dict[str, Any] = {"name": name, "ok": ok}
         if error:
             entry["error"] = error[:200]
         recorder.tool_calls.append(entry)
+        if ok and result is not None:
+            recorder.tool_results.append(result)
 
 
 def record_guardrail(action: str, **detail: Any) -> None:

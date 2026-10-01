@@ -342,8 +342,17 @@ async def test_no_chunks_but_tools_enabled_calls_the_model_not_the_refusal():
     ChatOrchestrator._prepare_turn and test_tool_calling_orchestration.py
     for the full coverage of this behavior. This is a lighter smoke test
     confirming the same wiring holds from this file's own fixtures."""
+    from app.observability.audit import record_tool_call
+
+    class _DatetimeToolProvider(FakeModelProvider):
+        async def generate(self, prompt: GroundedPrompt) -> ModelReply:
+            record_tool_call(
+                "current_datetime", ok=True, result={"iso": "2026-09-24T10:00:00+00:00"}
+            )
+            return await super().generate(prompt)
+
     retrieval = FakeRetrievalService([])
-    provider = FakeModelProvider(reply_text="It's currently 2026-09-24.")
+    provider = _DatetimeToolProvider(reply_text="It's currently 2026-09-24.")
     orchestrator = _make_orchestrator(retrieval=retrieval, provider=provider)
     config = _make_config(enabled_tools=["current_datetime"])
 

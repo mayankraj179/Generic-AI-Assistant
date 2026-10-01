@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 from app.config.assistant_config import ModelCapabilities
 from app.config.settings import Settings
+from app.orchestration.azure_ai_provider import AzureAIProvider
 from app.orchestration.gemini_provider import GeminiProvider
 from app.orchestration.grok_provider import GrokProvider
 from app.orchestration.model_provider import ModelProvider, ModelProviderError
@@ -24,11 +25,21 @@ def _build_xai_provider(model: ModelCapabilities, settings: Settings) -> ModelPr
     return GrokProvider(model_name=model.model_name, api_key=settings.xai_api_key)
 
 
+def _build_azure_ai_provider(model: ModelCapabilities, settings: Settings) -> ModelProvider:
+    # TEMP: Azure AI Foundry, added for testing (2026-09-30).
+    return AzureAIProvider(
+        model_name=model.model_name,
+        api_key=settings.azure_ai_api_key,
+        endpoint=settings.azure_ai_endpoint,
+    )
+
+
 _PROVIDER_BUILDERS: dict[str, _ProviderBuilder] = {
     "google_adk": _build_gemini_provider,
     "gemini": _build_gemini_provider,
     "openrouter": _build_openrouter_provider,
     "xai": _build_xai_provider,
+    "azure_ai": _build_azure_ai_provider,
 }
 
 

@@ -280,3 +280,53 @@ async def test_unscored_chunks_are_never_filtered():
     )
 
     assert results == [unscored_chunk]
+
+
+# ---------------------------------------------------------------------------
+# reply_uses_tool_result: the evidence check behind
+# ChatOrchestrator._require_tool_result.
+# ---------------------------------------------------------------------------
+
+_NOW = {"iso": "2026-09-30T14:05:11.341039+00:00", "timezone": "UTC", "day_of_week": "Wednesday"}
+
+
+@pytest.mark.parametrize(
+    ("reply", "result"),
+    [
+        ("4", {"result": 4.0, "expression": "2+2", "kind": "arithmetic"}),
+        ("2 + 2 = 4.", {"result": 4.0, "expression": "2+2", "kind": "arithmetic"}),
+        ("56,433 × 89 = **5,022,537**.", {"result": 5022537.0, "expression": "56433*89"}),
+        ("15% of 240 is 36.", {"result": 36.0, "expression": "15/100*240"}),
+        ("That's about 12.3%.", {"result": 12.3456, "expression": "x"}),
+        ("There are 92 days until then.", {"result": 92, "kind": "date_difference"}),
+        ("That was 82 days ago.", {"result": -82.0, "expression": "a - b"}),
+        ("Today's date is September 30, 2026.", _NOW),
+        ("Today is 30 Sep 2026.", _NOW),
+        ("It's 2026-09-30.", _NOW),
+        ("Today is 30/09/2026.", _NOW),
+        ("It's Wednesday.", _NOW),
+        ("It's 14:05 UTC.", _NOW),
+        ("It's 2:05 PM UTC.", _NOW),
+        ("It is 30.09.2026", {**_NOW, "formatted": "30.09.2026"}),
+    ],
+)
+def test_reply_uses_tool_result_accepts_a_stated_tool_value(reply, result):
+    assert output_guardrails.reply_uses_tool_result(reply, [result]) is True
+
+
+@pytest.mark.parametrize(
+    ("reply", "results"),
+    [
+        ("Paris.", [_NOW]),
+        ("The capital of France is Paris.", [{"result": 4.0, "expression": "2+2"}]),
+        ("Here's a relaxed Bali itinerary: start in Ubud, end in Seminyak.", [_NOW]),
+        ("I don't have enough information to answer that.", [_NOW]),
+        # Repeating the model's own tool arguments shows nothing computed.
+        ("You asked about 2+2 in UTC.", [{"result": 5.0, "expression": "2+2", "timezone": "UTC"}]),
+        ("Today is September 29, 2026.", [_NOW]),  # a different date
+        ("It is 14:06.", [_NOW]),  # a different time
+        ("Paris.", []),  # no successful tool call at all
+    ],
+)
+def test_reply_uses_tool_result_rejects_a_reply_that_states_no_tool_value(reply, results):
+    assert output_guardrails.reply_uses_tool_result(reply, results) is False

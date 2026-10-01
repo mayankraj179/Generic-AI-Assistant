@@ -64,19 +64,31 @@ NO_AUTHORIZED_CONTEXT_REPLY = (
 # Appended to system_prompt (never substituted for it) only for a turn with
 # no document context at all but at least one tool configured — see
 # ChatOrchestrator._prepare_turn. The hard gate lets this turn reach the
-# model instead of refusing outright, so this instruction is what actually
-# prevents a fabricated/document-flavored answer: the model must still
-# decline, on its own, when no available tool genuinely answers the
-# question, exactly the same "state clearly when you can't answer rather
-# than fabricate" principle the rest of this project already applies.
+# model instead of refusing outright. This instruction is NOT what enforces
+# the scope: ChatOrchestrator._require_tool_result replaces any reply on such
+# a turn that no successful tool call backs (live 2026-09-30: gpt-6-luna and
+# gemini-2.5-flash both answered "capital of France" from general knowledge
+# despite the earlier, softer wording). The wording steers the model towards
+# calling a tool even for trivial arithmetic, so a legitimate answer isn't
+# discarded.
 NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE = (
     "No document context was retrieved for this turn — you have no "
-    "authorized document content to draw on right now. Do not answer as "
-    "though you do, and never state or imply that an answer is backed by "
-    "the documents or a report. Only answer if one of your available tools "
-    "can directly answer the user's question on its own. If no available "
-    "tool applies, say clearly that you don't have enough information to "
-    "answer rather than guessing, estimating, or fabricating a response."
+    "authorized document content to draw on right now. You may answer only "
+    "by calling one of your available tools and reporting its result; the "
+    "application discards any reply on this turn that is not based on a "
+    "successful tool call. Call the tool even when you could answer without "
+    "it (for example simple arithmetic or today's date). Never answer from "
+    "your own general knowledge, and never state or imply that an answer is "
+    "backed by the documents or a report. If no available tool applies, say "
+    "clearly that you don't have enough information to answer."
+)
+
+# Replaces the model's reply on a no-document-context chart request that no
+# successful tool call backs (see ChatOrchestrator._require_tool_result).
+# Same message CHART_WITHOUT_CONTEXT_GUIDANCE asks the model for, but fixed.
+CHART_WITHOUT_CONTEXT_REPLY = (
+    "I need the specific figures or topic for the chart (for example, which "
+    "metric and which years) to build it from the documents."
 )
 
 # Appended, for every provider, on a turn where a chart will be attempted
@@ -192,6 +204,72 @@ ProviderFactory = Callable[[AssistantConfig], ModelProvider]
 EmbeddingProviderFactory = Callable[[AssistantConfig], EmbeddingProvider]
 
 
+# Citation markup some models write into their answer text in their own
+# trained syntax, inside fullwidth brackets: seen live from
+# nvidia/nemotron-3-super-120b-a12b as 【source: holidays_2026, chunk 3】,
+# 【nova_horizon_fy2025, chunk 0】 and 【{"cursor": 0, "loc": 123}】 (a browsing-
+# tool citation schema from its training, never anything this app sent it).
+# Sources reach the user through the structured citations field, so these
+# markers are removed from the text. Only citation-shaped content matches:
+# "source...", a {...} object, anything with a dagger, or "chunk N"; an
+# ordinary bracketed phrase is left alone.
+_CITATION_MARKUP_RE = re.compile(
+    r"[ \t]*【\s*(?:"
+    r"source\b[^】\n]*"  # 【source: holidays_2026, chunk 3】
+    r"|\{[^】\n]*\}"  # 【{"cursor": 0, "loc": 123}】
+    r"|[^】\n]*†[^】\n]*"  # 【4†L1-L5】-style
+    r"|[^】\n]*\bchunk\s*\d+[^】\n]*"  # 【nova_horizon_fy2025, chunk 0】
+    r")】",
+    re.IGNORECASE,
+)
+_MARKUP_OPEN = "【"
+_MAX_PENDING_MARKUP = 300
+
+
+def strip_citation_markup(text: str) -> tuple[str, int]:
+    """Returns the text without model-invented citation markers, and how many
+    were removed."""
+    cleaned, count = _CITATION_MARKUP_RE.subn("", text)
+    return cleaned, count
+
+
+class _StreamingMarkupStripper:
+    """Applies strip_citation_markup to streamed deltas. A marker can be split
+    across deltas, so text from an unclosed 【 onward is held back until it
+    closes (or grows implausibly long). No marker ever reaches the client; the
+    streamed text equals the stripped final text except for whitespace that
+    was already sent before a marker began."""
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self.removed = 0
+
+    def feed(self, delta: str) -> str:
+        text = self._pending + delta
+        cut = text.rfind(_MARKUP_OPEN)
+        if cut != -1 and "】" not in text[cut:] and len(text) - cut < _MAX_PENDING_MARKUP:
+            # The regex also removes spaces/tabs right before a marker, so
+            # hold those back with it.
+            while cut > 0 and text[cut - 1] in " \t":
+                cut -= 1
+            ready, self._pending = text[:cut], text[cut:]
+        else:
+            # A delta with no marker in it passes through unchanged, so
+            # ordinary streaming keeps its exact delta boundaries. The cost:
+            # a space already sent just before a marker can't be taken back,
+            # so the live stream may show "word ." where the persisted text
+            # reads "word.".
+            ready, self._pending = text, ""
+        cleaned, count = strip_citation_markup(ready)
+        self.removed += count
+        return cleaned
+
+    def flush(self) -> str:
+        cleaned, count = strip_citation_markup(self._pending)
+        self._pending, self.removed = "", self.removed + count
+        return cleaned
+
+
 def _message_requests_chart(message: str, patterns: Sequence[str]) -> bool:
     """Deterministic, cheap chart-intent gate — a small keyword/pattern set,
     not a classifier or a second model call. False means chart generation
@@ -217,12 +295,15 @@ class _PreparedTurn:
     enabled_tools, ``prompt`` is still assembled (with an empty
     retrieved_chunks and an added system-prompt instruction — see
     NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE) so the model gets a chance at a
-    tool-only answer instead of a hard refusal.
+    tool-only answer instead of a hard refusal. ``tool_result_fallback`` is
+    set exactly then: the fixed reply that replaces the model's if no tool
+    call succeeded during the turn (see ChatOrchestrator._require_tool_result).
     """
 
     conversation: Conversation
     prompt: GroundedPrompt | None
     chunks: tuple[Chunk, ...] = ()
+    tool_result_fallback: str | None = None
 
 
 @dataclass(frozen=True)
@@ -344,6 +425,15 @@ class ChatOrchestrator:
             return
         logger.exception("unexpected error in chat turn", exc_info=exc)
 
+    def _note_markup_removed(self, removed: int) -> None:
+        if removed:
+            record_guardrail("citation_markup_stripped", count=removed)
+            logger.info(
+                "removed %d model-generated citation marker(s) from the reply",
+                removed,
+                extra={"event": "citation_markup_stripped"},
+            )
+
     async def _end_turn(self, recorder: TurnRecorder) -> None:
         if self._audit_store is not None:
             await self._audit_store.write(recorder)
@@ -437,9 +527,29 @@ class ChatOrchestrator:
         ):
             reply = await provider.generate(setup.prompt)
 
+        reply_text, removed = strip_citation_markup(reply.text)
+        self._note_markup_removed(removed)
+        replacement = self._require_tool_result(setup, recorder, reply_text)
+        if replacement is not None:
+            await self._persist_turn(
+                conversation_id=setup.conversation.id,
+                principal=principal,
+                user_message=message,
+                reply_text=replacement,
+                citations=(),
+            )
+            if recorder is not None:
+                recorder.outcome = "no_context"
+            return ChatResult(
+                text=replacement,
+                conversation_id=setup.conversation.id,
+                citations=(),
+                grounded=False,
+            )
+
         guarded = self._apply_output_guardrails(
             config=config,
-            reply_text=reply.text,
+            reply_text=reply_text,
             model_grounded=reply.grounded,
             chunks=setup.chunks,
         )
@@ -600,6 +710,12 @@ class ChatOrchestrator:
             },
         )
         stream = provider.generate_stream(setup.prompt)
+        stripper = _StreamingMarkupStripper()
+        # A reply that _require_tool_result may still replace must not reach
+        # the client before that check, so such a turn is held back and sent
+        # as one delta. Tool turns on OpenRouter, xAI and Azure already arrive
+        # as one delta; this only changes Gemini's.
+        hold_back = setup.tool_result_fallback is not None
         try:
             while True:
                 with trace.use_span(model_span, end_on_exit=False):
@@ -611,8 +727,10 @@ class ChatOrchestrator:
                     final_text = stream_event.text
                     final_grounded = stream_event.grounded
                     final_chart = stream_event.chart
-                elif stream_event.delta:
-                    yield ChatStreamDelta(text=stream_event.delta)
+                elif stream_event.delta and not hold_back:
+                    visible = stripper.feed(stream_event.delta)
+                    if visible:
+                        yield ChatStreamDelta(text=visible)
         except ModelProviderError as exc:
             # Nothing persisted — see the persistence policy above. The
             # failure is logged and audited here because it never reaches
@@ -628,6 +746,28 @@ class ChatOrchestrator:
             recorder.outcome, recorder.error_class = "error", "EmptyStream"
             yield ChatStreamError(detail="the assistant model is temporarily unavailable")
             return
+
+        final_text, removed = strip_citation_markup(final_text)
+        self._note_markup_removed(removed)
+        replacement = self._require_tool_result(setup, recorder, final_text)
+        if replacement is not None:
+            recorder.outcome = "no_context"
+            await self._persist_turn(
+                conversation_id=setup.conversation.id,
+                principal=principal,
+                user_message=message,
+                reply_text=replacement,
+                citations=(),
+            )
+            yield ChatStreamDelta(text=replacement)
+            yield ChatStreamDone(
+                conversation_id=setup.conversation.id, citations=(), grounded=False
+            )
+            return
+
+        tail = stripper.flush()
+        if tail:
+            yield ChatStreamDelta(text=tail)
 
         guarded = self._apply_output_guardrails(
             config=config,
@@ -659,6 +799,8 @@ class ChatOrchestrator:
             citations=citations,
         )
 
+        if hold_back:
+            yield ChatStreamDelta(text=guarded.text)
         if chart is not None:
             yield ChatStreamChart(chart=chart)
 
@@ -783,8 +925,8 @@ class ChatOrchestrator:
                 # case that hits the hard safe-refusal gate. When
                 # enabled_tools is non-empty we fall through instead of
                 # returning here, so the model gets a chance at a tool-only
-                # answer (see NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE below for
-                # what stops it from fabricating a document-backed one).
+                # answer; _require_tool_result discards the reply unless a
+                # tool call actually succeeded.
                 # Regression guard: an assistant with retrieval on but no
                 # tools configured (e.g. hr_assistant) always takes this
                 # branch on zero chunks, exactly as before this change.
@@ -803,15 +945,15 @@ class ChatOrchestrator:
             chart_requested = False
 
         system_prompt = config.system_prompt
+        tool_result_fallback: str | None = None
         if not chunks and config.enabled_tools:
-            # Tools are this turn's only possible route to a real answer —
-            # the hard gate no longer protects this case, so the model must
-            # be told explicitly not to fabricate a document-backed answer,
-            # and to decline on its own if no available tool actually
-            # applies to this question either.
+            # Tools are this turn's only possible route to a real answer.
+            # The guidance steers the model; _require_tool_result enforces it.
             system_prompt = f"{system_prompt}\n\n{NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE}"
+            tool_result_fallback = NO_AUTHORIZED_CONTEXT_REPLY
             if chart_trigger_matched:
                 system_prompt = f"{system_prompt}\n\n{CHART_WITHOUT_CONTEXT_GUIDANCE}"
+                tool_result_fallback = CHART_WITHOUT_CONTEXT_REPLY
         if chart_requested:
             system_prompt = f"{system_prompt}\n\n{CHART_TURN_GUIDANCE}"
 
@@ -824,7 +966,42 @@ class ChatOrchestrator:
             enabled_tools=tuple(config.enabled_tools),
             max_tool_calls=config.max_tool_calls,
         )
-        return _PreparedTurn(conversation=conversation, prompt=prompt, chunks=tuple(chunks))
+        return _PreparedTurn(
+            conversation=conversation,
+            prompt=prompt,
+            chunks=tuple(chunks),
+            tool_result_fallback=tool_result_fallback,
+        )
+
+    def _require_tool_result(
+        self, setup: _PreparedTurn, recorder: TurnRecorder | None, reply_text: str
+    ) -> str | None:
+        """The code-level scope guarantee for a no-document-context turn: the
+        model's reply stands only if it states a value that a successful tool
+        call returned this turn (output.reply_uses_tool_result). Otherwise
+        returns the fixed reply that must replace it. Every provider reports
+        its tool calls into the turn recorder, so this check is
+        provider-neutral. With no recorder it fails closed.
+
+        Known limit: a reply that states a tool value and also answers
+        something else ("2 + 2 = 4, and the capital of France is Paris")
+        passes, so that remainder is only as scoped as the model makes it."""
+        if setup.tool_result_fallback is None:
+            return None
+        tool_calls = recorder.tool_calls if recorder is not None else []
+        tool_results = recorder.tool_results if recorder is not None else []
+        if output_guardrails.reply_uses_tool_result(reply_text, tool_results):
+            return None
+        record_guardrail(
+            "ungrounded_reply_replaced",
+            tool_calls=len(tool_calls),
+            successful_tool_calls=len(tool_results),
+        )
+        logger.info(
+            "replaced a reply with no document context and no successful tool call",
+            extra={"event": "ungrounded_reply_replaced"},
+        )
+        return setup.tool_result_fallback
 
     async def _reuse_previous_answer_context(
         self,

@@ -459,7 +459,10 @@ class GeminiProvider:
             result = response.response if isinstance(response.response, dict) else {}
             error = result.get("error")
             record_tool_call(
-                response.name or "", ok=error is None, error=str(error) if error else None
+                response.name or "",
+                ok=error is None,
+                error=str(error) if error else None,
+                result=result,
             )
 
     async def _new_seeded_session(
