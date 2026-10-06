@@ -27,9 +27,9 @@ _RUN_LIVE = os.getenv("RUN_LIVE_AZURE_TESTS") == "1"
 _API_KEY = os.getenv("AZURE_AI_API_KEY")
 _ENDPOINT = Settings().azure_ai_endpoint
 
-# The model actually configured for the Azure testing assistant, not a
+# The model actually configured for the (Azure) HR assistant, not a
 # hardcoded literal.
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "hr_assistant_azure.yaml"
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "hr_assistant.yaml"
 _MODEL_NAME = (
     load_assistant_config(_CONFIG_PATH).model.model_name if _CONFIG_PATH.exists() else None
 )

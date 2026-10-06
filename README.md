@@ -1,7 +1,34 @@
 # Generic AI Assistant Framework
 
-Day 1 scaffold. Backend: Python 3.12 + FastAPI + Pydantic v2. Frontend: React + Vite
-Shadow DOM embeddable widget. DB: Postgres + pgvector, via Alembic migrations.
+Backend: Python 3.12 + FastAPI + Pydantic v2. Application UI: `ui/` (React + Vite,
+Keycloak sign-in via Authorization Code + PKCE). Embeddable widget: `frontend/` (React +
+Vite Shadow DOM custom element). DB: Postgres + pgvector, via Alembic migrations.
+
+## Running the whole stack (local development)
+
+Three terminals, from the repository root:
+
+```
+# 1. Postgres, Redis, Keycloak, Jaeger
+cd infra
+docker compose up -d
+
+# 2. Backend API on http://localhost:8000
+cd backend
+.\.venv\Scripts\Activate.ps1
+alembic upgrade head
+python -m uvicorn app.main:app --reload
+
+# 3. Application UI on http://localhost:5174
+cd ui
+npm install
+npm run dev
+```
+
+Open **http://localhost:5174**, click **Sign in with Keycloak**, and log in on Keycloak's
+own page (dev user `dev_user` / `dev_password123`). See `ui/README.md` for UI configuration.
+The UI never sees the password; it receives tokens through the PKCE code exchange and sends
+`Authorization: Bearer <access token>` to the backend.
 
 ## Backend
 
@@ -31,8 +58,8 @@ specific interactive session/process that hit it (a security product doing per-p
 socket filtering, a VPN client, or similar), not a persistent, generally-reproducible cause —
 not something this repo can detect or fix. **If you hit this**: run the backend on a
 different port instead, e.g. `python -m uvicorn app.main:app --reload --port 8001`, and
-point the frontend dev harness's "API base URL" field (`frontend/chat.html`) at
-`http://localhost:8001` to match. If the wrong port ends up in that field, `postChat`/
+set `VITE_API_BASE=http://localhost:8001` in `ui/.env` (see `ui/.env.example`) and
+restart `npm run dev` to match. If the wrong port ends up in that field, `postChat`/
 `postChatStream` now report it by name (`Could not reach http://localhost:8000 — check the
 API base URL and confirm the backend is running there.`) instead of a generic "is it
 running?" message, so a base-URL mismatch is visible directly in the error text.
@@ -88,7 +115,9 @@ AUTH_AUDIENCE=generic-ai-api
 AUTH_JWKS_URL=http://localhost:8080/realms/generic-ai-dev/protocol/openid-connect/certs
 ```
 
-To obtain a token locally:
+The application UI (`ui/`) signs in with Authorization Code + PKCE (the client requires
+S256 PKCE). For command-line testing only (curl, ingestion), the dev client still allows the
+password grant — no UI uses it:
 
 ```
 curl -X POST 'http://localhost:8080/realms/generic-ai-dev/protocol/openid-connect/token' \
@@ -136,7 +165,8 @@ Later, the same flow can be used with Microsoft Entra ID or another OIDC provide
 
 ### Not yet implemented
 - Employee-specific authorization, manager/HR/admin policies, or claim-to-role mapping beyond the development default.
-- Frontend login UI, password-based auth, or app-owned identity flows.
+- Password-based auth in any UI, or app-owned identity flows (`ui/` uses Keycloak's
+  hosted login via Authorization Code + PKCE).
 - Database-backed app users; identity remains external to the framework.
 - Additional model/tool execution logic beyond the request boundary.
 
@@ -154,17 +184,19 @@ migration has not been applied against a real database. The migration file itsel
 (`alembic/versions/0001_initial_documents_and_chunks.py`) has not been executed,
 only authored.
 
-## Frontend
+## Application UI
 
-```
-cd frontend
-npm install
-npm run dev
-```
+`ui/` is the application to run — see "Running the whole stack" above and `ui/README.md`.
 
-**Not run yet in this session** — `npm install` was not attempted. The widget
-(`src/widget.tsx`, `src/AssistantWidgetApp.tsx`) is a mount/unmount shell only,
-no chat logic.
+## Embeddable widget (`frontend/`)
+
+`frontend/` builds the `<assistant-widget>` custom element (`src/widget.tsx`,
+`src/AssistantWidgetApp.tsx`, `src/api.ts`) as a library (`npm run build` → `dist/`) for
+embedding in other host pages. It has no sign-in of its own: the host page supplies an
+access token through the `auth-token` attribute. It is not needed to run the application.
+
+For widget development only, `npm run dev` in `frontend/` serves a harness on
+http://localhost:5173 (`chat.html`: paste a dev token obtained with the curl command above).
 
 ## Known environment issue
 

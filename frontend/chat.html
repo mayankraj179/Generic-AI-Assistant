@@ -55,8 +55,10 @@
   <body>
     <h1>Assistant Widget dev harness</h1>
     <p>
-      Fill in a dev access token (see README.md → "Local Keycloak development
-      setup" for how to obtain one via <code>curl</code>) and click
+      Widget development only — the application UI is <code>ui/</code>
+      (http://localhost:5174). Fill in a dev access token (see README.md →
+      "Local Keycloak development setup" for how to obtain one via
+      <code>curl</code>) and click
       <strong>Load widget</strong> to mount <code>&lt;assistant-widget&gt;</code>
       against the running backend. Attributes are only read once when the
       element is created, so the widget is re-created from scratch on every
@@ -74,7 +76,7 @@
       <input
         id="auth-token"
         name="auth-token"
-        placeholder="paste a dev access token here, or pass ?token=... in the URL"
+        placeholder="paste a dev access token here"
         autocomplete="off"
       />
       <span class="hint">Never commit a real token — this field is intentionally left empty by default.</span>
@@ -90,14 +92,6 @@
       const assistantIdInput = document.getElementById("assistant-id");
       const authTokenInput = document.getElementById("auth-token");
       const container = document.getElementById("widget-container");
-
-      // Convenience for manual testing: `chat.html?token=...` pre-fills the
-      // token field instead of requiring a paste every time. Never put a
-      // real token in this file itself.
-      const tokenFromQuery = new URLSearchParams(window.location.search).get("token");
-      if (tokenFromQuery) {
-        authTokenInput.value = tokenFromQuery;
-      }
 
       document.getElementById("setup-form").addEventListener("submit", (event) => {
         event.preventDefault();

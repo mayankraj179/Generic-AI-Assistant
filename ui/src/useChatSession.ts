@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from "react";
-import { getMessages, postChatStream } from "./api";
+import { ApiAuthError, getMessages, postChatStream } from "./api";
 import { API_BASE } from "./config";
 import type { DisplayMessage } from "./Message";
 
@@ -58,6 +58,10 @@ export function useChatSession({ getToken, onSessionExpired, onTurnSaved }: Chat
         );
       } catch (err) {
         if (gen !== generation.current) return;
+        if (err instanceof ApiAuthError && err.status === 401) {
+          setIsLoading(false);
+          return onSessionExpired();
+        }
         const detail = err instanceof Error ? err.message : "Could not load this chat.";
         setMessages([{ id: newId(), role: "error", content: detail }]);
       } finally {
@@ -112,6 +116,7 @@ export function useChatSession({ getToken, onSessionExpired, onTurnSaved }: Chat
             { id: newId(), role: "error", content: detail },
           ]);
         },
+        onUnauthorized: () => !stale() && onSessionExpired(),
       });
       finish(); // postChatStream never throws — every failure goes through onError
     },

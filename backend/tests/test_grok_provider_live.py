@@ -25,9 +25,9 @@ _RUN_LIVE = os.getenv("RUN_LIVE_GROK_TESTS") == "1"
 _API_KEY = os.getenv("XAI_API_KEY")
 
 # The model actually configured for the Grok assistant, not a hardcoded
-# literal — keeps this test honest if configs/hr_assistant_grok.yaml's
+# literal — keeps this test honest if configs/examples/hr_assistant_grok.yaml's
 # model_name ever changes.
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "hr_assistant_grok.yaml"
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "examples" / "hr_assistant_grok.yaml"
 _MODEL_NAME = (
     load_assistant_config(_CONFIG_PATH).model.model_name if _CONFIG_PATH.exists() else None
 )

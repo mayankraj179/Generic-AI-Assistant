@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bitwise Intranet - Employee Home</title>
+    <!-- Demo host page for the embeddable launcher (npm run dev →
+         http://localhost:5174/portal-demo.html). Its own CSS is deliberately
+         opinionated (root font size, global button/font rules) to show that
+         nothing reaches the widget inside its shadow root. -->
+    <style>
+      html { font-size: 18px; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        line-height: 1.5;
+        color: #1d2733;
+        background: #eef2f6;
+      }
+      button { background: #1f6feb; color: #fff; border: 2px solid #0b3d91; padding: 8px 14px; font-size: 1rem; border-radius: 3px; }
+      a { color: inherit; }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 24px;
+        padding: 0 32px;
+        height: 64px;
+        background: #0f2a44;
+        color: #fff;
+      }
+      .logo { font-weight: 700; font-size: 1.1rem; letter-spacing: 0.02em; }
+      .logo span { color: #7cc4ff; }
+      nav { display: flex; gap: 4px; flex-wrap: wrap; }
+      nav a { padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 0.85rem; opacity: 0.85; }
+      nav a:hover, nav a[aria-current="page"] { background: rgb(255 255 255 / 12%); opacity: 1; }
+      .who { margin-left: auto; font-size: 0.8rem; opacity: 0.8; }
+      main { max-width: 1100px; margin: 0 auto; padding: 32px; }
+      h1 { margin: 0 0 4px; font-size: 1.6rem; }
+      .lede { margin: 0 0 24px; color: #5b6b7c; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 18px; }
+      .card { padding: 18px 20px; background: #fff; border: 1px solid #d8e0e8; border-radius: 6px; }
+      .card h2 { margin: 0 0 6px; font-size: 1rem; }
+      .card p { margin: 0 0 12px; font-size: 0.85rem; color: #5b6b7c; }
+      @media (max-width: 640px) {
+        header { padding: 0 16px; height: auto; flex-wrap: wrap; gap: 8px; padding-block: 10px; }
+        .who { display: none; }
+        main { padding: 20px 16px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="logo">Bitwise <span>Intranet</span></div>
+      <nav id="nav"></nav>
+      <div class="who">Employee Home</div>
+    </header>
+    <main id="content"></main>
+
+    <script>
+      // Fake multi-page portal: ?page=… is a real navigation (full reload),
+      // used to check the chat survives moving between portal pages.
+      const PAGES = {
+        home: ["Employee Home", "Good to see you. Here's what's happening this week.", [
+          ["Announcements", "Office closed on 2 October for Gandhi Jayanti."],
+          ["My tasks", "2 trainings due · 1 timesheet to submit"],
+          ["Quick links", "IT helpdesk · Travel desk · Directory"],
+        ]],
+        leave: ["Leave", "Apply for leave and check your balances.", [
+          ["Balances", "Casual 9 · Earned 14 · Sick 6"],
+          ["Holiday calendar", "See the 2026 list of fixed and floating holidays."],
+          ["Policy", "Questions? Ask Bitwise Assist in the corner."],
+        ]],
+        payroll: ["Payroll", "Payslips, tax declarations and reimbursements.", [
+          ["Latest payslip", "September 2026 — available"],
+          ["Tax declaration", "Window opens in April."],
+        ]],
+        benefits: ["Benefits", "Insurance, wellness and learning budgets.", [
+          ["Health insurance", "Family floater · policy card"],
+          ["Learning budget", "Annual allowance remaining"],
+        ]],
+        documents: ["Documents", "Company policies and handbooks.", [
+          ["HR policies", "Leave, travel, code of conduct"],
+          ["Finance", "Annual report FY2025"],
+        ]],
+      };
+      const params = new URLSearchParams(location.search);
+      const current = PAGES[params.get("page")] ? params.get("page") : "home";
+      const [title, lede, cards] = PAGES[current];
+      document.title = `Bitwise Intranet - ${title}`;
+      document.getElementById("nav").innerHTML = Object.entries(PAGES)
+        .map(([key, [label]]) =>
+          `<a href="?page=${key}"${key === current ? ' aria-current="page"' : ""}>${key === "home" ? "Home" : label}</a>`)
+        .join("");
+      document.getElementById("content").innerHTML =
+        `<h1>${title}</h1><p class="lede">${lede}</p><div class="grid">` +
+        cards.map(([h, p]) => `<section class="card"><h2>${h}</h2><p>${p}</p><button type="button">Open</button></section>`).join("") +
+        `</div>`;
+    </script>
+
+    <!-- The launcher. In a real deployment this is the built bundle:
+         <script src="https://…/bitwise-assist.js" data-api-base="…" …></script>
+         Here the dev server serves the source; data-bitwise-assist marks the
+         tag because module scripts have no document.currentScript. -->
+    <script
+      type="module"
+      src="/src/embed.tsx"
+      data-bitwise-assist
+      data-default-assistant="hr_assistant"
+      data-position="right"
+    ></script>
+  </body>
+</html>

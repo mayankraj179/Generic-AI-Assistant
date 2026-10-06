@@ -102,6 +102,23 @@ button:focus-visible, select:focus-visible, textarea:focus-visible {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent);
 }
 
+.topbar-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; margin-left: auto; }
+
+.topbar-btn {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--ink-soft);
+  transition: background 120ms, color 120ms;
+}
+.topbar-btn:hover { background: color-mix(in srgb, var(--ink) 9%, transparent); color: var(--ink); }
+.topbar-btn[aria-pressed="true"] { color: var(--accent); }
+
 .menu-btn {
   display: none;
   border: 0;
@@ -132,7 +149,16 @@ button:focus-visible, select:focus-visible, textarea:focus-visible {
   padding: 18px 14px 14px;
   background: var(--sidebar);
   border-right: 1px solid var(--line);
+  transition: margin-left 280ms var(--ease), visibility 0s;
 }
+
+/* Full-screen chat: the sidebar slides out (and stops being focusable). */
+.app.is-fullscreen .sidebar {
+  margin-left: calc(-1 * var(--sidebar-width));
+  visibility: hidden;
+  transition: margin-left 280ms var(--ease), visibility 0s linear 280ms;
+}
+.app.is-fullscreen .menu-btn { display: none; }
 
 .brand { display: flex; align-items: center; gap: 10px; padding: 0 6px 6px; }
 
@@ -293,7 +319,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible {
   margin: 20px 0 6px;
   font-family: var(--font-display);
   font-weight: 500;
-  font-size: clamp(28px, 2rem + 1vw, 40px);
+  font-size: clamp(28px, 32px + 1vw, 40px);
   letter-spacing: -0.02em;
   line-height: 1.15;
 }
@@ -541,7 +567,6 @@ button:focus-visible, select:focus-visible, textarea:focus-visible {
 .signin-card h1 { margin: 18px 0 6px; font-family: var(--font-display); font-weight: 600; font-size: 30px; letter-spacing: -0.02em; }
 .signin-card p { margin: 0 0 24px; color: var(--ink-soft); }
 .signin-error { padding: 10px; border-radius: var(--radius-sm); background: var(--error-bg); color: var(--error-ink) !important; font-size: 13px; }
-.signin-hint { margin: 18px 0 0 !important; font-size: 12.5px; color: var(--ink-faint) !important; }
 
 .primary-btn {
   width: 100%;

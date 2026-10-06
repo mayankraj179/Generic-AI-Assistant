@@ -5,6 +5,9 @@ import pytest
 from app.config.loader import ConfigLoadError, load_all_assistant_configs, load_assistant_config
 
 CONFIGS_DIR = Path(__file__).parent.parent / "configs"
+# Parked configs (Grok, the duplicate Azure HR config, OpenRouter): kept
+# for reference, never loaded.
+EXAMPLES_DIR = CONFIGS_DIR / "examples"
 
 
 def test_loads_sample_hr_assistant_config():
@@ -41,20 +44,18 @@ def test_load_all_configs_from_directory():
 
 
 def test_active_assistants_and_their_providers():
-    # configs/examples/ is not scanned (non-recursive glob), so the parked
-    # OpenRouter example must not be loaded as a live assistant.
+    # Only the two Azure assistants are active. configs/examples/ is not
+    # scanned (non-recursive glob), so the parked Grok, duplicate Azure and
+    # OpenRouter configs must not be loaded as live assistants.
     configs = load_all_assistant_configs(CONFIGS_DIR)
     assert {aid: c.model.provider for aid, c in configs.items()} == {
         "hr_assistant": "azure_ai",
         "finance_assistant": "azure_ai",
-        "hr_assistant_grok": "xai",
-        "finance_assistant_grok": "xai",
-        "hr_assistant_azure": "azure_ai",
     }
 
 
 def test_azure_testing_config_is_marked_temp_and_mirrors_hr_assistant():
-    azure = load_assistant_config(CONFIGS_DIR / "hr_assistant_azure.yaml")
+    azure = load_assistant_config(EXAMPLES_DIR / "hr_assistant_azure.yaml")
     hr = load_assistant_config(CONFIGS_DIR / "hr_assistant.yaml")
     assert azure.model.provider == "azure_ai"
     assert azure.model.model_name == "gpt-6-luna"
@@ -67,7 +68,7 @@ def test_azure_testing_config_is_marked_temp_and_mirrors_hr_assistant():
 
 
 def test_hr_grok_assistant_uses_grok_chat_and_temp_gemini_embeddings():
-    grok = load_assistant_config(CONFIGS_DIR / "hr_assistant_grok.yaml")
+    grok = load_assistant_config(EXAMPLES_DIR / "hr_assistant_grok.yaml")
     hr = load_assistant_config(CONFIGS_DIR / "hr_assistant.yaml")
     assert grok.model.provider == "xai"
     assert grok.model.model_name == "grok-4.3"
@@ -83,7 +84,7 @@ def test_hr_grok_assistant_uses_grok_chat_and_temp_gemini_embeddings():
 
 
 def test_finance_grok_assistant_mirrors_finance_assistant_except_chat_model():
-    grok = load_assistant_config(CONFIGS_DIR / "finance_assistant_grok.yaml")
+    grok = load_assistant_config(EXAMPLES_DIR / "finance_assistant_grok.yaml")
     finance = load_assistant_config(CONFIGS_DIR / "finance_assistant.yaml")
     assert grok.model.provider == "xai"
     assert grok.model.model_name == "grok-4.3"

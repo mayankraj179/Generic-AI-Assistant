@@ -271,6 +271,10 @@ export interface PostChatStreamParams extends PostChatParams {
   onChart?: (chart: Chart) => void;
   onDone: (result: { conversationId: string; citations: Citation[]; grounded: boolean }) => void;
   onError: (detail: string) => void;
+  /** Called instead of onError when the backend answers 401 (token
+   * rejected), so the caller can end the session rather than keep sending
+   * a token the backend no longer accepts. */
+  onUnauthorized?: () => void;
 }
 
 /** POST /chat/stream — same turn as postChat, but the reply arrives as SSE
@@ -292,7 +296,7 @@ export async function postChatStream(
   token: string,
   params: PostChatStreamParams,
 ): Promise<void> {
-  const { onDelta, onChart, onDone, onError, ...chatParams } = params;
+  const { onDelta, onChart, onDone, onError, onUnauthorized, ...chatParams } = params;
   const body: { assistant_id: string; message: string; conversation_id?: string } = {
     assistant_id: chatParams.assistantId,
     message: chatParams.message,
@@ -317,7 +321,11 @@ export async function postChatStream(
   }
 
   if (response.status === 401) {
-    onError("Not authenticated");
+    if (onUnauthorized) {
+      onUnauthorized();
+    } else {
+      onError("Not authenticated");
+    }
     return;
   }
   if (response.status === 403) {

@@ -48,6 +48,14 @@ OIDC Authorization Code + PKCE against Keycloak's public client — the app
 never sees a password. Tokens live in `sessionStorage` (per tab) and are
 refreshed automatically before they expire. Every API call sends
 `Authorization: Bearer <access token>`, exactly as the backend expects.
+If a refresh fails or the backend answers 401, the local tokens are
+dropped and the sign-in screen is shown. **Sign out** clears them and ends
+the Keycloak session.
+
+The Keycloak client (`generic-ai-api` in `infra/keycloak/realm-export.json`)
+requires S256 PKCE. Keycloak only imports that file when the realm doesn't
+exist yet, so an existing `keycloak_data` volume keeps whatever client
+settings it was created with.
 
 ## Backend endpoints used
 
@@ -60,6 +68,92 @@ refreshed automatically before they expire. Every API call sends
 The backend has no "list my conversations" endpoint, so the sidebar's chat
 list is kept in the browser's `localStorage` (titles and ids only — message
 content is always re-fetched from the backend, which enforces ownership).
+
+## Embedding on another page (chat launcher)
+
+The same app also ships as a floating launcher for an intranet or portal
+page: a bubble in the corner opens a compact chat popup, and **Maximize**
+expands the same live conversation into the full layout above (sidebar,
+history, assistant picker, sign out). Maximize/restore never restarts the
+chat or interrupts a streaming reply.
+
+**Try it:** with `npm run dev` running, open
+**http://localhost:5174/portal-demo.html**. It's a fake "Bitwise Intranet"
+page whose nav links are real page loads, so you can check the chat
+survives navigation.
+
+**Build it:** `npm run build:embed` writes one self-contained file,
+`dist-embed/bitwise-assist.js` (React and CSS included, ~607 kB, ~180 kB
+gzipped; most of that is recharts). Add it to any page:
+
+```html
+<script src="https://assist.example.com/bitwise-assist.js"
+  data-api-base="https://assist-api.example.com"
+  data-keycloak-url="https://sso.example.com" data-realm="generic-ai-dev"
+  data-client-id="generic-ai-api"
+  data-default-assistant="hr_assistant"
+  data-position="right"
+  data-z-index="2147483000"></script>
+```
+
+Every attribute is optional; defaults are those in `src/config.ts`.
+`data-default-assistant` falls back to the first assistant `GET /assistants`
+returns if it isn't offered. `data-position` is `right` (default) or `left`.
+
+How it behaves:
+
+- **Isolation.** The widget renders in a Shadow DOM root, so the host page's
+  CSS can't restyle it and its CSS can't leak out. Sizes are in px, so the
+  host's root font size doesn't distort it. The only thing it adds to the
+  host document is the Google Fonts `<link>` in `<head>`, because
+  `@font-face` doesn't register from inside a shadow root.
+- **Sign-in.** If signed out, the popup shows a "Sign in with Keycloak" card.
+  Sign-in is the same full-page Authorization Code + PKCE redirect as the
+  app. Keycloak returns to the exact page you were on (path, query and hash),
+  the `code`/`state` parameters are removed, and the popup reopens. The widget
+  never sees a password.
+- **No iframe.** Keycloak's login page refuses to be framed
+  (`X-Frame-Options: SAMEORIGIN`, `frame-ancestors 'self'`, verified against
+  the dev Keycloak), so the widget lives in the host page itself.
+- **One login = one new chat.** The open/closed/maximized state and the
+  active conversation id are kept in `sessionStorage["gaaf.widget"]`, so
+  moving between portal pages keeps the chat open and intact. A fresh
+  sign-in (a completed code exchange) and sign-out clear the conversation;
+  a normal page load, a token refresh or maximize/restore don't. Past chats
+  stay in the maximized sidebar history.
+- **Keyboard.** Escape steps down one level: maximized → popup → closed.
+  Opening the popup focuses the message box.
+- On screens 480px wide or less, the popup is a full-screen sheet.
+
+### Deploying on a different origin
+
+The demo works with no configuration changes because it runs on
+`http://localhost:5174`. A real portal at, say, `https://intranet.example.com`
+needs:
+
+1. **Backend CORS:** add the portal origin to the allow-list in
+   `backend/app/main.py` (local dev currently allows `*`).
+2. **Keycloak client** `generic-ai-api`: add a **Valid redirect URI** for the
+   portal pages (e.g. `https://intranet.example.com/*`; the query string is
+   part of the redirect URI, so a wildcard is needed for pages with query
+   parameters) and the portal origin under **Web origins**.
+3. Serve `bitwise-assist.js` from anywhere the portal can load scripts from,
+   and allow that source, the API, Keycloak and Google Fonts in the portal's
+   Content-Security-Policy if it has one.
+
+If the portal already signs users in through the same Keycloak realm,
+"Sign in" is instant: Keycloak's SSO cookie completes the redirect without
+showing a login form.
+
+### Known limitation (security)
+
+Embedded in-page, the tokens live in the **host page's** origin storage
+(`sessionStorage`), so any script running on that portal page can read
+them, the same as any other code in that page. Use it only on pages whose
+scripts you trust. The hardening path is to serve the chat from its own
+origin in an iframe and have that frame do the sign-in redirect in a popup
+window or top-level navigation, which keeps tokens out of the host
+origin. That is not implemented.
 
 ## Troubleshooting
 
@@ -86,11 +180,14 @@ content is always re-fetched from the backend, which enforces ownership).
 ```
 ui/
 ├── index.html
+├── portal-demo.html      # fake intranet page hosting the launcher (dev)
 ├── vite.config.ts        # dev server on :5174
+├── vite.embed.config.ts  # npm run build:embed → dist-embed/bitwise-assist.js
 ├── .env.example
 └── src/
     ├── main.tsx          # completes the sign-in redirect, mounts the app
-    ├── ChatApp.tsx       # sign-in screen, layout, empty state
+    ├── ChatApp.tsx       # sign-in screen, FullLayout, empty state
+    ├── useChatController.ts # assistants, history, the one chat session
     ├── useChatSession.ts # messages + streaming for the open conversation
     ├── Sidebar.tsx       # new chat, assistant picker, chat history
     ├── Message.tsx       # message rendering, sources, copy
@@ -101,5 +198,10 @@ ui/
     ├── api.ts            # backend client (snake_case wire format)
     ├── history.ts        # sidebar chat list (localStorage)
     ├── config.ts         # endpoints + starter prompts
-    └── app.css           # design tokens and styles
+    ├── app.css           # design tokens and styles
+    ├── embed.tsx         # launcher entry: script data-*, Shadow DOM mount
+    └── widget/
+        ├── Launcher.tsx  # bubble, compact popup, maximized overlay
+        ├── widgetState.ts # view + active conversation (sessionStorage)
+        └── widget.css    # launcher styles (on top of app.css)
 ```

@@ -30,7 +30,49 @@ export interface SignedInUser {
 }
 
 const endpoint = (path: string) => `${KEYCLOAK_ISSUER}/protocol/openid-connect/${path}`;
-const redirectUri = () => `${window.location.origin}${window.location.pathname}`;
+// Parameters Keycloak adds to the callback; everything else in the query
+// belongs to the host page and is kept, so a portal page like
+// /home?page=leave reloads as itself after sign-in, not as bare /home.
+const CALLBACK_PARAMS = ["code", "state", "session_state", "iss", "error", "error_description", "error_uri"];
+
+/** This page's URL minus the hash and any callback parameters. Identical
+ * at sign-in time and at callback time, as the code exchange requires. */
+const redirectUri = () => {
+  const url = new URL(window.location.href);
+  url.hash = "";
+  CALLBACK_PARAMS.forEach((p) => url.searchParams.delete(p));
+  return url.href;
+};
+
+interface PendingSignIn {
+  verifier: string;
+  state: string;
+  /** Full URL (query + hash included) the user signed in from. */
+  returnTo?: string;
+}
+
+function takePendingSignIn(): PendingSignIn | null {
+  const raw = sessionStorage.getItem(PKCE_KEY);
+  sessionStorage.removeItem(PKCE_KEY);
+  try {
+    return raw ? (JSON.parse(raw) as PendingSignIn) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Where to put the address bar after the callback: the page the user
+ * signed in from (any path, query or hash on this origin), else the
+ * callback URL without its code/state. */
+function returnUrl(pending: PendingSignIn | null): string {
+  try {
+    const target = new URL(pending?.returnTo ?? "", window.location.href);
+    if (pending?.returnTo && target.origin === window.location.origin) return target.href;
+  } catch {
+    // Unparseable — fall through.
+  }
+  return redirectUri();
+}
 
 function base64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -78,7 +120,8 @@ export async function signIn(): Promise<void> {
   const verifier = randomString(48);
   const state = randomString(16);
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-  sessionStorage.setItem(PKCE_KEY, JSON.stringify({ verifier, state }));
+  const pending: PendingSignIn = { verifier, state, returnTo: window.location.href };
+  sessionStorage.setItem(PKCE_KEY, JSON.stringify(pending));
 
   const params = new URLSearchParams({
     client_id: KEYCLOAK_CLIENT_ID,
@@ -93,22 +136,29 @@ export async function signIn(): Promise<void> {
 }
 
 /** Completes a sign-in redirect if the current URL carries one. Returns
- * true when tokens were obtained. Throws on a tampered/stale callback. */
+ * true when tokens were obtained — i.e. a fresh sign-in, as opposed to a
+ * normal page load with an existing session. Throws on a tampered/stale
+ * callback. Either way the address bar is put back to the page the user
+ * started from, minus the code/state. */
 export async function completeSignInIfRedirected(): Promise<boolean> {
   const url = new URL(window.location.href);
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
+  const error = url.searchParams.get("error");
+  if (error && state) {
+    // Keycloak redirected back without a code (user cancelled, login
+    // disabled, ...). Clear the callback from the URL and surface it.
+    window.history.replaceState(null, "", returnUrl(takePendingSignIn()));
+    throw new Error(`Sign-in was not completed (${url.searchParams.get("error_description") ?? error}).`);
+  }
   if (!code || !state) {
     return false;
   }
-  window.history.replaceState(null, "", redirectUri());
-
-  const pending = sessionStorage.getItem(PKCE_KEY);
-  sessionStorage.removeItem(PKCE_KEY);
-  const { verifier, state: expectedState } = pending
-    ? (JSON.parse(pending) as { verifier: string; state: string })
-    : { verifier: "", state: "" };
-  if (!verifier || state !== expectedState) {
+  // Must equal the redirect_uri sent to /auth (see redirectUri()).
+  const callbackRedirectUri = redirectUri();
+  const pending = takePendingSignIn();
+  window.history.replaceState(null, "", returnUrl(pending));
+  if (!pending?.verifier || state !== pending.state) {
     throw new Error("Sign-in response did not match this browser session. Please sign in again.");
   }
 
@@ -116,12 +166,16 @@ export async function completeSignInIfRedirected(): Promise<boolean> {
     await requestTokens({
       grant_type: "authorization_code",
       code,
-      redirect_uri: redirectUri(),
-      code_verifier: verifier,
+      redirect_uri: callbackRedirectUri,
+      code_verifier: pending.verifier,
     }),
   );
   return true;
 }
+
+// Shared by concurrent callers so a burst of requests near expiry spends the
+// refresh token once instead of racing several refreshes against Keycloak.
+let pendingRefresh: Promise<string | null> | null = null;
 
 /** A valid access token, refreshed when close to expiry; null when the
  * session is gone and the user must sign in again. */
@@ -133,15 +187,22 @@ export async function getAccessToken(): Promise<string | null> {
   if (tokens.expiresAt - REFRESH_MARGIN_MS > Date.now()) {
     return tokens.accessToken;
   }
-  try {
-    const refreshed = saveTokens(
-      await requestTokens({ grant_type: "refresh_token", refresh_token: tokens.refreshToken }),
-    );
-    return refreshed.accessToken;
-  } catch {
-    sessionStorage.removeItem(TOKENS_KEY);
-    return null;
-  }
+  pendingRefresh ??= requestTokens({ grant_type: "refresh_token", refresh_token: tokens.refreshToken })
+    .then((response) => saveTokens(response).accessToken)
+    .catch(() => {
+      clearSession();
+      return null;
+    })
+    .finally(() => {
+      pendingRefresh = null;
+    });
+  return pendingRefresh;
+}
+
+/** Drops the local token set without a Keycloak round trip — used when the
+ * backend rejects the token (401), so it is never sent again. */
+export function clearSession(): void {
+  sessionStorage.removeItem(TOKENS_KEY);
 }
 
 export function currentUser(): SignedInUser | null {
@@ -161,7 +222,7 @@ export function currentUser(): SignedInUser | null {
 
 export function signOut(): void {
   const idToken = readTokens()?.idToken;
-  sessionStorage.removeItem(TOKENS_KEY);
+  clearSession();
   const params = new URLSearchParams({
     client_id: KEYCLOAK_CLIENT_ID,
     post_logout_redirect_uri: redirectUri(),
