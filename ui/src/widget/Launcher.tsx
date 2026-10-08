@@ -1,6 +1,6 @@
 import { type ReactNode, type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import { clearSession, currentUser, type SignedInUser, signIn, signOut } from "../auth";
-import { EmptyState, FullLayout } from "../ChatApp";
+import { EmptyState, FullLayout, SignInScreen } from "../ChatApp";
 import { Composer } from "../Composer";
 import { Message, SparkIcon } from "../Message";
 import { type ChatController, PREFERRED_ASSISTANT, useChatController } from "../useChatController";
@@ -11,12 +11,23 @@ export interface LauncherProps {
   position?: "right" | "left";
   zIndex?: number;
   signInError?: string;
+  /** "popup" (default, for embedding on any site): signed-out users get a
+   * sign-in card inside the popup, which reopens after the redirect.
+   * "page": signed-out users get a full-page sign-in first, and land on the
+   * closed launcher (just the AI button) once signed in. */
+  signInMode?: "popup" | "page";
 }
 
 /** Embeddable launcher: bubble → compact popup → maximized overlay.
  * Auth (auth.ts), the chat session and the API layer are the same ones the
  * standalone app uses; this only adds the shell around them. */
-export function Launcher({ defaultAssistant = PREFERRED_ASSISTANT, position = "right", zIndex = 2147483000, signInError }: LauncherProps) {
+export function Launcher({
+  defaultAssistant = PREFERRED_ASSISTANT,
+  position = "right",
+  zIndex = 2147483000,
+  signInError,
+  signInMode = "popup",
+}: LauncherProps) {
   const [user, setUser] = useState<SignedInUser | null>(currentUser);
   const [view, setView] = useState<WidgetView>(() => loadWidgetState().view);
   const [error, setError] = useState(signInError);
@@ -40,8 +51,8 @@ export function Launcher({ defaultAssistant = PREFERRED_ASSISTANT, position = "r
     clearSession();
     setError("Your session has ended. Please sign in again.");
     setUser(null);
-    setView((v) => (v === "maximized" ? "popup" : v));
-  }, []);
+    setView((v) => (signInMode === "page" ? "closed" : v === "maximized" ? "popup" : v));
+  }, [signInMode]);
 
   const handleSignOut = useCallback(() => {
     clearWidgetState();
@@ -49,10 +60,21 @@ export function Launcher({ defaultAssistant = PREFERRED_ASSISTANT, position = "r
   }, []);
 
   const startSignIn = () => {
-    // Persist "popup" first so it reopens on this page after the redirect.
-    saveWidgetState({ view: "popup" });
+    // Persisted before the redirect, so it's the view on return: page mode
+    // lands on the closed launcher, popup mode reopens the popup.
+    saveWidgetState({ view: signInMode === "page" ? "closed" : "popup" });
     void signIn();
   };
+
+  if (!user && signInMode === "page") {
+    return (
+      <div className="ba-root" style={{ zIndex }}>
+        <div className="ba-gate">
+          <SignInScreen error={error} onSignIn={startSignIn} />
+        </div>
+      </div>
+    );
+  }
 
   const isOpen = view !== "closed";
   return (

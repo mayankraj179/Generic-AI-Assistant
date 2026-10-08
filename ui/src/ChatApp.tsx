@@ -6,7 +6,9 @@ import { Message, SparkIcon } from "./Message";
 import { Sidebar } from "./Sidebar";
 import { type ChatController, useChatController } from "./useChatController";
 
-export function SignInScreen({ error }: { error?: string }) {
+/** `onSignIn` lets the launcher record its own state before the redirect;
+ * the standalone app just starts the redirect. */
+export function SignInScreen({ error, onSignIn = () => void signIn() }: { error?: string; onSignIn?: () => void }) {
   return (
     <main className="signin">
       <div className="signin-card">
@@ -14,7 +16,7 @@ export function SignInScreen({ error }: { error?: string }) {
         <h1>Bitwise Assist</h1>
         <p>Answers from your organisation&apos;s policy documents, with sources.</p>
         {error && <p className="signin-error" role="alert">{error}</p>}
-        <button type="button" className="primary-btn" onClick={() => void signIn()}>
+        <button type="button" className="primary-btn" onClick={onSignIn}>
           Sign in with Keycloak
         </button>
       </div>

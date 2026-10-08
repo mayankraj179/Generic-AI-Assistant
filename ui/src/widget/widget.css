@@ -189,6 +189,12 @@
 .ba-signin .signin-error { width: 100%; }
 .ba-signin .primary-btn { max-width: 280px; }
 
+/* ---------- page sign-in (data-sign-in="page") ---------- */
+
+/* Covers the host page until the user signs in; reuses app.css's .signin. */
+.ba-gate { position: fixed; inset: 0; overflow-y: auto; }
+.ba-gate .signin { min-height: 100%; }
+
 /* ---------- maximized overlay ---------- */
 
 .ba-backdrop {

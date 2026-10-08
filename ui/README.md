@@ -24,7 +24,14 @@ npm run dev
 ```
 
 Open **http://localhost:5174**, click **Sign in with Keycloak** and log in
-(dev realm user: `dev_user` / `dev_password123`).
+(dev realm user: `dev_user` / `dev_password123`). You land on a demo company
+intranet page with only the **AI button** (bottom-right):
+
+```
+signed in → AI button → click → compact chat window → maximize → full UI
+```
+
+The full-page app on its own is at **http://localhost:5174/app.html**.
 
 ## Configuration
 
@@ -77,10 +84,11 @@ expands the same live conversation into the full layout above (sidebar,
 history, assistant picker, sign out). Maximize/restore never restarts the
 chat or interrupts a streaming reply.
 
-**Try it:** with `npm run dev` running, open
-**http://localhost:5174/portal-demo.html**. It's a fake "Bitwise Intranet"
-page whose nav links are real page loads, so you can check the chat
-survives navigation.
+**Try it:** with `npm run dev` running, open **http://localhost:5174/**
+(`index.html`). It's a fake "Bitwise Intranet" page whose nav links are
+real page loads, so you can check the chat survives navigation. It sets
+`data-sign-in="page"`, so you sign in first and then land on the closed
+launcher.
 
 **Build it:** `npm run build:embed` writes one self-contained file,
 `dist-embed/bitwise-assist.js` (React and CSS included, ~607 kB, ~180 kB
@@ -93,7 +101,8 @@ gzipped; most of that is recharts). Add it to any page:
   data-client-id="generic-ai-api"
   data-default-assistant="hr_assistant"
   data-position="right"
-  data-z-index="2147483000"></script>
+  data-z-index="2147483000"
+  data-sign-in="popup"></script>
 ```
 
 Every attribute is optional; defaults are those in `src/config.ts`.
@@ -107,11 +116,16 @@ How it behaves:
   host's root font size doesn't distort it. The only thing it adds to the
   host document is the Google Fonts `<link>` in `<head>`, because
   `@font-face` doesn't register from inside a shadow root.
-- **Sign-in.** If signed out, the popup shows a "Sign in with Keycloak" card.
-  Sign-in is the same full-page Authorization Code + PKCE redirect as the
-  app. Keycloak returns to the exact page you were on (path, query and hash),
-  the `code`/`state` parameters are removed, and the popup reopens. The widget
-  never sees a password.
+- **Sign-in.** Sign-in is the same full-page Authorization Code + PKCE
+  redirect as the app. Keycloak returns to the exact page you were on (path,
+  query and hash) and the `code`/`state` parameters are removed. The widget
+  never sees a password. `data-sign-in` picks where signed-out users sign in:
+  - `popup` (default, for embedding on any site): the bubble shows, and the
+    popup holds a "Sign in with Keycloak" card; the popup reopens after
+    sign-in.
+  - `page` (what this app's `index.html` uses): a full-page sign-in covers
+    the page first; after signing in you land on the closed launcher (just
+    the AI button). Sign-out returns to the sign-in page.
 - **No iframe.** Keycloak's login page refuses to be framed
   (`X-Frame-Options: SAMEORIGIN`, `frame-ancestors 'self'`, verified against
   the dev Keycloak), so the widget lives in the host page itself.
@@ -179,8 +193,8 @@ origin. That is not implemented.
 
 ```
 ui/
-├── index.html
-├── portal-demo.html      # fake intranet page hosting the launcher (dev)
+├── index.html            # "/": demo intranet page + the launcher (entry page)
+├── app.html              # "/app.html": the full-page app on its own
 ├── vite.config.ts        # dev server on :5174
 ├── vite.embed.config.ts  # npm run build:embed → dist-embed/bitwise-assist.js
 ├── .env.example

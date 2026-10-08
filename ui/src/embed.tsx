@@ -6,7 +6,8 @@
  *     data-keycloak-url="http://localhost:8080" data-realm="generic-ai-dev"
  *     data-client-id="generic-ai-api"
  *     data-default-assistant="hr_assistant"
- *     data-position="right" data-z-index="2147483000"></script>
+ *     data-position="right" data-z-index="2147483000"
+ *     data-sign-in="popup"></script>
  *
  * Every attribute is optional; defaults come from config.ts. The widget
  * renders inside a Shadow DOM root, so host CSS can't reach it and its CSS
@@ -82,6 +83,7 @@ async function mount(): Promise<void> {
         position={data.position === "left" ? "left" : "right"}
         zIndex={Number.isFinite(zIndex) && zIndex > 0 ? zIndex : undefined}
         signInError={signInError}
+        signInMode={data.signIn === "page" ? "page" : "popup"}
       />
     </StrictMode>,
   );
