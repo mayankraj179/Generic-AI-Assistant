@@ -1,0 +1,87 @@
+assistant_id: kb_demo_assistant
+display_name: Knowledge Sources Demo
+description: >
+  Example assistant fed by all three knowledge source types: local documents,
+  an S3-compatible bucket and a database table. Sync with POST
+  /admin/ingest/sync {"assistant_id": "kb_demo_assistant", "tenant_id": ...}.
+tenant_id: bitwise-global
+
+model:
+  provider: azure_ai
+  model_name: gpt-6-luna
+  supports_tools: true
+  supports_streaming: true
+  thinking_level: null
+  configurable_thinking: false
+  max_context_tokens: 128000
+
+retrieval:
+  enabled: true
+  collection_name: kb_demo_docs
+  exact_search_threshold: 500
+  top_k: 8
+  # Same Gemini embedding model and cutoff as hr_assistant (0.66, measured
+  # there); re-measure if this corpus grows. Database rows are short
+  # "column: value" documents, so their scores run a little differently.
+  min_similarity: 0.66
+  embedding_provider: gemini
+
+# Onboarding a source is YAML only. Each one needs a unique name, explicit
+# access_labels, and credentials as ${ENV_VAR} references (a literal secret
+# fails config loading). Every source is read-only.
+knowledge_sources:
+  # Local or uploaded documents. Relative paths resolve against backend/.
+  - name: it_handbook
+    type: filesystem
+    path: sample_sources/kb_demo/handbook
+    access_labels: ["role:authenticated"]
+
+  # S3-compatible object storage: every supported file under the prefix.
+  - name: policy_bucket
+    type: object_storage
+    endpoint_url: http://localhost:9000
+    bucket: kb-demo
+    prefix: policies/
+    access_key_id: ${KB_DEMO_S3_ACCESS_KEY}
+    secret_access_key: ${KB_DEMO_S3_SECRET_KEY}
+    access_labels: ["role:authenticated"]
+
+  # A database snapshot: reviewed, parameterised SELECTs only, one document
+  # per row (keyed by key_column), re-synced on demand. Runs in a READ ONLY
+  # transaction with a statement timeout; more than max_rows rows fails the
+  # sync instead of truncating it.
+  - name: office_db
+    type: database
+    url: ${KB_DEMO_DB_URL}
+    max_rows: 1000
+    statement_timeout_ms: 5000
+    access_labels: ["scope:development"]
+    queries:
+      - name: office_directory
+        key_column: office_code
+        sql: >
+          SELECT office_code, city, address, it_helpdesk_extension, reception_hours
+          FROM office_directory
+          WHERE is_active = :active
+          ORDER BY office_code
+        params:
+          active: true
+
+enabled_tools: []
+
+guardrails:
+  prompt_injection_screening: true
+  input_pii_block: false
+  output_pii_block: false
+  max_input_chars: 4000
+  unsafe_output_patterns: []
+
+system_prompt: >
+  You are a workplace information assistant. Answer only from the retrieved
+  content (IT support handbook, travel and expense policy, office directory).
+  Never invent details. Give the direct answer first. Do not write citation
+  markers, source tags or bracketed references in the reply; the application
+  lists the sources separately. If the retrieved content does not settle the
+  question, say plainly that it does not.
+
+min_clearance: 0

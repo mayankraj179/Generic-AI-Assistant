@@ -289,19 +289,36 @@ def parse(source: SourceWithAccess) -> ParsedDocument:
     if not file_path.exists() or not file_path.is_file():
         raise FileNotFoundError(f"source file does not exist: {file_path}")
 
+    return parsed_document(
+        source, title=file_path.stem or file_path.name, raw_text=extract_text(file_path)
+    )
+
+
+def is_supported_file(name: str) -> bool:
+    """Whether discover()/extract_text() handle this file name's suffix."""
+    return Path(name).suffix.lower() in _SUPPORTED_SUFFIXES
+
+
+def extract_text(file_path: Path) -> str:
+    """parse()'s format dispatch on its own, for knowledge-source adapters
+    whose files aren't addressed by a local path URI (e.g. an object
+    downloaded to a temp file)."""
     suffix = file_path.suffix.lower()
     if suffix in _PDF_SUFFIXES:
-        raw_text = _parse_pdf(file_path)
-    elif suffix in _DOCX_SUFFIXES:
-        raw_text = _parse_docx(file_path)
-    elif suffix in _XLSX_SUFFIXES:
-        raw_text = _parse_xlsx(file_path)
-    elif suffix in _HTML_SUFFIXES:
-        raw_text = _parse_html(file_path)
-    else:
-        raw_text = _parse_plain_text(file_path)
+        return _parse_pdf(file_path)
+    if suffix in _DOCX_SUFFIXES:
+        return _parse_docx(file_path)
+    if suffix in _XLSX_SUFFIXES:
+        return _parse_xlsx(file_path)
+    if suffix in _HTML_SUFFIXES:
+        return _parse_html(file_path)
+    return _parse_plain_text(file_path)
 
-    title = file_path.stem or file_path.name
+
+def parsed_document(source: SourceWithAccess, *, title: str, raw_text: str) -> ParsedDocument:
+    """Builds a ParsedDocument with the one content-hash rule (sha256 of the
+    stripped text) every source shares, so idempotency means the same thing
+    for a file, an object and a database row."""
     stripped_text = raw_text.strip()
     content_hash = hashlib.sha256(stripped_text.encode("utf-8")).hexdigest()
     return ParsedDocument(

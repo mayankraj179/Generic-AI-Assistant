@@ -22,7 +22,13 @@ from app.api.chat import (
     CreateSessionResponse,
     MessageOut,
 )
-from app.api.ingest import AdminIngestRequest, AdminIngestResponse
+from app.api.ingest import (
+    AdminIngestRequest,
+    AdminIngestResponse,
+    AdminSyncRequest,
+    AdminSyncResponse,
+    SourceSyncSummary,
+)
 from app.auth.dependencies import require_permission
 from app.auth.provider import JwtAuthProvider
 from app.config.loader import load_all_assistant_configs
@@ -53,6 +59,7 @@ from app.services.conversation_store import ConversationNotFoundError, Conversat
 from app.services.embedding import EmbeddingProviderError
 from app.services.embedding_provider_factory import get_embedding_provider
 from app.services.ingestion_service import IngestionService
+from app.services.source_sync import sync_knowledge_sources
 
 configure_logging()
 configure_tracing()
@@ -420,6 +427,68 @@ async def admin_ingest(
         ) from exc
 
     return AdminIngestResponse(source_uri=request.source_path, chunks_ingested=len(chunks))
+
+
+@app.post("/admin/ingest/sync", response_model=AdminSyncResponse)
+async def admin_sync_sources(
+    request: AdminSyncRequest,
+    principal: Annotated[
+        PrincipalContext,
+        Depends(require_permission("admin:ingest")),
+    ],
+    ingestion_service: Annotated[IngestionService, Depends(get_ingestion_service)],
+) -> AdminSyncResponse:
+    """Syncs an assistant's configured knowledge_sources. A source that can't
+    be discovered is reported as failed in the body (the others still sync);
+    an embedding outage stops the sync with a 503."""
+    del principal
+    configs = load_all_assistant_configs(CONFIGS_DIR)
+    config = configs.get(request.assistant_id)
+    if config is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown assistant_id '{request.assistant_id}'",
+        )
+    names = [source.name for source in config.knowledge_sources]
+    if not names:
+        raise HTTPException(
+            status_code=422,
+            detail=f"assistant '{request.assistant_id}' has no knowledge_sources configured",
+        )
+    if request.source is not None and request.source not in names:
+        raise HTTPException(
+            status_code=422,
+            detail=f"assistant '{request.assistant_id}' has no knowledge source "
+            f"'{request.source}' (configured: {', '.join(names)})",
+        )
+
+    embedder = get_embedding_provider(config=config, settings=settings)
+    try:
+        results = await sync_knowledge_sources(
+            config,
+            tenant_id=request.tenant_id,
+            ingestion=ingestion_service,
+            embedder=embedder,
+            # Relative filesystem paths in configs resolve against backend/.
+            base_dir=CONFIGS_DIR.parent,
+            only=request.source,
+        )
+    except EmbeddingProviderError as exc:
+        failure = find_failure(exc)
+        if failure is not None:
+            log_provider_failure(logger, failure, exc)
+        else:
+            logger.error("embedding failed while syncing '%s': %s", request.assistant_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="the embedding provider is temporarily unavailable",
+        ) from exc
+
+    return AdminSyncResponse(
+        assistant_id=config.assistant_id,
+        tenant_id=request.tenant_id,
+        sources=[SourceSyncSummary(**vars(result)) for result in results],
+    )
 
 
 @app.get("/admin/usage")

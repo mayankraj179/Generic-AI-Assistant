@@ -165,6 +165,46 @@ class PgVectorStore:
             await session.refresh(document)
             return document
 
+    async def retire_missing_documents(
+        self,
+        *,
+        tenant_id: str,
+        assistant_id: str,
+        uri_prefix: str,
+        keep_uris: set[str],
+    ) -> list[str]:
+        """Retires every document under ``uri_prefix`` (one knowledge
+        source's namespace) whose URI isn't in ``keep_uris``: its current
+        chunks become is_current=false, the same soft retire a generation
+        replace uses, so nothing is deleted. Its content_hash is reset to ''
+        (never a real sha256), so if it reappears at the source it is
+        re-ingested rather than skipped as unchanged. Returns the URIs
+        retired by this call; ones already retired aren't counted again.
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(DocumentRecord.id, DocumentRecord.source_uri).where(
+                    DocumentRecord.tenant_id == tenant_id,
+                    DocumentRecord.assistant_id == assistant_id,
+                    DocumentRecord.source_uri.startswith(uri_prefix, autoescape=True),
+                    DocumentRecord.content_hash != "",
+                )
+            )
+            gone = [(doc_id, uri) for doc_id, uri in rows if uri not in keep_uris]
+            if not gone:
+                return []
+            ids = [doc_id for doc_id, _ in gone]
+            await session.execute(
+                update(ChunkRecord)
+                .where(ChunkRecord.document_id.in_(ids), ChunkRecord.is_current.is_(True))
+                .values(is_current=False)
+            )
+            await session.execute(
+                update(DocumentRecord).where(DocumentRecord.id.in_(ids)).values(content_hash="")
+            )
+            await session.commit()
+        return sorted(uri for _, uri in gone)
+
     async def count_chunks(self, *, tenant_id: str, assistant_id: str) -> int:
         async with self._session_factory() as session:
             result = await session.execute(

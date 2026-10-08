@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.config.knowledge_sources import (
+    KnowledgeSourceConfig,
+    check_source_types,
+    check_unique_source_names,
+)
 from app.tools.builtin import TOOL_REGISTRY
 
 # Deterministic, keyword/pattern-based chart-intent gate (see
@@ -108,6 +113,11 @@ class AssistantConfig(BaseModel):
     this schema exists to support.
     """
 
+    # A rejected value is never echoed in validation errors: a literal secret
+    # caught in knowledge_sources must not end up in the error (or the logs).
+    # The error still names the field and the reason.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     assistant_id: str
     display_name: str
     description: str
@@ -115,6 +125,10 @@ class AssistantConfig(BaseModel):
 
     model: ModelCapabilities
     retrieval: RetrievalConfig | None = None
+    # Where this assistant's documents come from; synced by
+    # POST /admin/ingest/sync. Empty means content arrives some other way
+    # (e.g. one file at a time through /admin/ingest).
+    knowledge_sources: list[KnowledgeSourceConfig] = Field(default_factory=list)
     named_queries: list[NamedQuery] = Field(default_factory=list)
     enabled_tools: list[str] = Field(default_factory=list)
     # Hard cap on tool-call round-trips a provider may make while producing
@@ -138,6 +152,16 @@ class AssistantConfig(BaseModel):
                 f"assistant_id '{v}' must be alphanumeric with optional - or _"
             )
         return v
+
+    @field_validator("knowledge_sources", mode="before")
+    @classmethod
+    def _known_source_types(cls, v: object) -> object:
+        return check_source_types(v)
+
+    @field_validator("knowledge_sources")
+    @classmethod
+    def _unique_source_names(cls, v: list[KnowledgeSourceConfig]) -> list[KnowledgeSourceConfig]:
+        return check_unique_source_names(v)
 
     @field_validator("enabled_tools")
     @classmethod

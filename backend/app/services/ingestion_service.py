@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Literal
 
 from app.config.settings import Settings
 from app.db.database import create_session_factory
 from app.ingestion.pipeline import (
     Chunk,
     DiscoveredSource,
+    ParsedDocument,
     ParseError,
     SourceWithAccess,
     capture_access,
@@ -20,6 +23,16 @@ from app.services.gemini_embedding import GeminiEmbeddingProvider
 from app.services.vector_store import PgVectorStore
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class IngestOutcome:
+    """What ingest_parsed() did with one document: ``created`` and
+    ``replaced`` embedded ``chunks``; ``unchanged`` (content, labels and
+    embedding model all match what's stored) and ``empty`` embedded nothing."""
+
+    action: Literal["created", "replaced", "unchanged", "empty"]
+    chunks: list[Chunk]
 
 
 class IngestionService:
@@ -109,7 +122,24 @@ class IngestionService:
         )
 
         parsed = parse(with_access)
+        outcome = await self.ingest_parsed(
+            parsed, tenant_id=tenant_id, assistant_id=assistant_id, embedder=embedder
+        )
+        return outcome.chunks
 
+    async def ingest_parsed(
+        self,
+        parsed: ParsedDocument,
+        *,
+        tenant_id: str,
+        assistant_id: str,
+        embedder: EmbeddingProvider | None = None,
+    ) -> IngestOutcome:
+        """Everything after parsing, shared by every source: the
+        skip-if-unchanged fingerprint check, chunking, embedding and the
+        atomic generation replace. Keyed by parsed.source.source.uri."""
+        with_access = parsed.source
+        discovered = with_access.source
         active_embedder = embedder or self.embedder
         existing = await self.vector_store.get_document_fingerprint(
             tenant_id=tenant_id, assistant_id=assistant_id, source_uri=discovered.uri
@@ -126,16 +156,14 @@ class IngestionService:
                 "ingestion skipped (content, access labels and embedding model unchanged): %s",
                 discovered.uri,
             )
-            return []
+            return IngestOutcome("unchanged", [])
 
         chunked = chunk(parsed)
         if not chunked:
             logger.info("ingestion produced no chunks (empty document): %s", discovered.uri)
-            return []
+            return IngestOutcome("empty", [])
 
-        embeddings = await active_embedder.embed_documents(
-            [item.embedded_text for item in chunked]
-        )
+        embeddings = await active_embedder.embed_documents([item.embedded_text for item in chunked])
         await self.vector_store.store_document(
             tenant_id=tenant_id,
             assistant_id=assistant_id,
@@ -149,4 +177,4 @@ class IngestionService:
         )
         action = "created new document" if existing is None else "replaced generation for"
         logger.info("ingestion %s: %s (%d chunks)", action, discovered.uri, len(chunked))
-        return chunked
+        return IngestOutcome("created" if existing is None else "replaced", chunked)

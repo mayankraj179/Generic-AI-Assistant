@@ -21,6 +21,8 @@ dependencies = [
     "pypdf>=5.0.0",
     "python-docx>=1.1.0",
     "openpyxl>=3.1.0",
+    # object_storage knowledge sources (S3 and S3-compatible stores like MinIO).
+    "boto3>=1.35.0",
     # Python's stdlib zoneinfo has no bundled IANA database on Windows (or
     # any system lacking /usr/share/zoneinfo) — confirmed live: ZoneInfo("UTC")
     # itself raised ZoneInfoNotFoundError on this dev machine before adding
@@ -38,6 +40,7 @@ packages = [
     "app.db",
     "app.guardrails",
     "app.ingestion",
+    "app.ingestion.sources",
     "app.orchestration",
     "app.services",
     "app.tools",
