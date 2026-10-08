@@ -110,7 +110,10 @@ class JwtAuthProvider:
             raise AuthenticationError("malformed or invalid token") from exc
         except AuthenticationError:
             raise
-        except (TypeError, ValueError) as exc:
+        # RecursionError: a deeply nested JSON payload can escape PyJWT's own
+        # error handling (GHSA-42vr-xj54-vc7v, PyJWT < 2.15); it must be a
+        # 401 like any other malformed token, never a 500.
+        except (TypeError, ValueError, RecursionError) as exc:
             raise AuthenticationError("malformed or invalid token") from exc
 
     def _extract_bearer_token(self, authorization_header: str | None) -> str:

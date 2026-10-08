@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from datetime import UTC, datetime, timedelta
 
 import jwt
@@ -245,3 +247,63 @@ def test_client_cannot_override_principal_identity(
     assert principal.principal_id == "dev-user-123"
     assert principal.tenant_id == "dev-tenant"
     assert "role:admin" not in principal.labels
+
+
+def _deeply_nested_token(depth: int = 6000) -> str:
+    """A forged token whose payload is JSON nested `depth` levels deep
+    (PyJWT GHSA-42vr-xj54-vc7v). At depth 6000 it is ~16 KB, which still fits
+    in uvicorn's 16 KB request-header limit, so a real client can send it."""
+
+    def b64url(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "test-key"}).encode())
+    payload = b64url(b"[" * depth + b"]" * depth)
+    return f"{header}.{payload}.{b64url(b'forged-signature')}"
+
+
+def test_deeply_nested_token_returns_401_not_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same path as production: keys come from JWKS (no static signing key).
+    # The payload is parsed before any key is fetched, so the unreachable
+    # JWKS URL is never contacted.
+    settings = Settings(
+        auth_enabled=True,
+        auth_issuer="http://localhost:8080/realms/generic-ai-dev",
+        auth_audience="generic-ai-api",
+        auth_jwks_url="http://127.0.0.1:9/unreachable/certs",
+    )
+    monkeypatch.setattr(app.state, "auth_provider", JwtAuthProvider(settings=settings))
+    # raise_server_exceptions=False: an unhandled error must surface as the
+    # 500 a real client would get, not as an exception inside the test.
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get(
+        "/assistants", headers={"Authorization": f"Bearer {_deeply_nested_token()}"}
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "malformed or invalid token"}
+
+
+def test_recursion_error_during_validation_is_rejected_as_invalid_token(
+    provider: JwtAuthProvider,
+    signing_keys: tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pins our own guard independently of the PyJWT version: even if a
+    # library call raises RecursionError, validation fails closed with a 401.
+    private_key, _ = signing_keys
+    token = _make_token(
+        private_key=private_key,
+        issuer="http://localhost:8080/realms/generic-ai-dev",
+        audience="generic-ai-api",
+    )
+
+    def raise_recursion_error(*args: object, **kwargs: object) -> None:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(jwt, "decode", raise_recursion_error)
+
+    with pytest.raises(AuthenticationError) as excinfo:
+        provider.validate_token(token)
+    assert excinfo.value.detail == "malformed or invalid token"
