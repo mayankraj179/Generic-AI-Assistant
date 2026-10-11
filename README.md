@@ -183,14 +183,14 @@ so onboarding a data source is YAML only. All three types are read-only:
 |---|---|---|---|
 | `filesystem` | supported files under a directory (or one file) | file | `fs://<name>/<relative path>` |
 | `object_storage` | supported objects under an S3-compatible bucket/prefix | object | `s3://<name>/<key>` |
-| `database` | reviewed, parameterised SELECTs (PostgreSQL) | row (`key_column`) | `db://<name>/<query>/<key>` |
+| `database` | reviewed, parameterised SELECTs (PostgreSQL, MySQL, SQL Server, Oracle) | row (`key_column`) | `db://<name>/<query>/<key>` |
 
 Each source needs a unique `name` and explicit `access_labels`. Credentials are only
 `${ENV_VAR}` references; a literal secret, a password inside a URL, a missing or unknown
-`type`, or a non-SELECT query fails config loading. Database queries run in a READ ONLY
-transaction with a statement timeout, and more rows (or objects) than the cap fails the
-sync rather than truncating it. See `backend/configs/kb_demo_assistant.yaml` for one of
-each.
+`type`, or a non-SELECT query fails config loading. Database queries run read-only (what
+that means per engine is under [Database sources](#database-sources)) with a statement
+timeout, and more rows (or objects) than the cap fails the sync rather than truncating it.
+See `backend/configs/kb_demo_assistant.yaml` for one of each.
 
 Sync an assistant's sources (`admin:ingest` permission; `source` is optional):
 
@@ -218,6 +218,195 @@ python scripts/seed_kb_demo.py
 # live adapter tests (offline hash embeddings, throwaway tenant):
 $env:RUN_LIVE_SOURCE_TESTS = "1"; python -m pytest tests/test_knowledge_sources_live.py
 ```
+
+### Database sources
+
+A `database` source reads rows from an external database at sync time. Their embeddings
+are stored in the framework's own PostgreSQL/pgvector database, as for every other source.
+The two databases are separate: an assistant can read from MySQL and still store in
+pgvector.
+
+**Engines.** `dialect` picks the engine. It defaults to `postgresql`, so configs written
+before dialects existed still work. Every engine goes through SQLAlchemy's own dialects and
+drivers; there is no custom protocol code. Only the drivers below are accepted. Any other
+driver in the URL is refused at sync time, even if SQLAlchemy could load it.
+
+| `dialect` | driver (URL scheme) | install | verified live against | read-only enforcement | statement timeout |
+|---|---|---|---|---|---|
+| `postgresql` | asyncpg 0.31 (`postgresql+asyncpg://`) | core dependency | PostgreSQL 16 | `SET TRANSACTION READ ONLY` | server `statement_timeout` (transaction-local) |
+| `mysql` | PyMySQL 1.2 (`mysql+pymysql://`) | `pip install -e ".[mysql]"` | MySQL 8.4 | `START TRANSACTION READ ONLY` | server `max_execution_time` (SELECT only) + client `read_timeout` backstop |
+| `mssql` | pymssql 2.4 (`mssql+pymssql://`) | `pip install -e ".[mssql]"` | SQL Server 2022 | **none in the engine**: the transaction is always rolled back, never committed | pymssql query timeout, rounded **up to whole seconds**, plus `SET LOCK_TIMEOUT` |
+| `oracle` | python-oracledb 26, thin mode (`oracle+oracledb://`) | `pip install -e ".[oracle]"` | Oracle Database 23ai Free | `SET TRANSACTION READ ONLY` | driver `call_timeout` (per round trip) |
+
+`pip install -e ".[databases]"` installs all three optional drivers.
+- A bare scheme such as `mysql://...` means the driver in the table.
+- A URL whose scheme doesn't match `dialect` fails the sync for that source. Examples are
+  `mariadb://`, or a `postgresql://` URL on a `mysql` source.
+- MariaDB, aiomysql/asyncmy, pyodbc/aioodbc and cx_Oracle are **not** supported or tested.
+- Adding an engine means one class in `backend/app/ingestion/sources/dialects.py`; that
+  module's docstring lists the steps.
+
+**YAML.** `backend/configs/examples/database_sources.yaml` has one source per engine.
+
+```yaml
+knowledge_sources:
+  - name: employee_directory
+    type: database
+    dialect: mysql                      # postgresql (default) | mysql | mssql | oracle
+    url: ${HR_DATABASE_URL}             # an env var reference only, never the URL itself
+    password: ${HR_DATABASE_PASSWORD}   # optional, for a secret store that hands it out separately
+    access_labels: ["role:authenticated"]
+    max_rows: 1000                      # per query; more fails the sync (never truncates)
+    statement_timeout_ms: 5000
+    fetch_batch_size: 500               # rows per round trip (server-side cursor where available)
+    queries:
+      - name: employee_records
+        key_column: employee_id         # unique, non-null: the row's stable identity
+        sql: |
+          SELECT employee_id, department, job_title
+          FROM employee_directory
+          WHERE active = :active
+        params:
+          active: true
+```
+
+Connection URLs go in the environment or `backend/.env`:
+
+```
+HR_DATABASE_URL=postgresql+asyncpg://kb_reader:<password>@db-host:5432/hr
+HR_DATABASE_URL=mysql+pymysql://kb_reader:<password>@db-host:3306/hr
+HR_DATABASE_URL=mssql+pymssql://kb_reader:<password>@db-host:1433/hr
+HR_DATABASE_URL=oracle+oracledb://kb_reader:<password>@db-host:1521/?service_name=HRPDB
+```
+
+**Checked at config load.** None of these checks touch the network.
+- `url` and `password` must be `${NAME}` references. A literal value fails loading, and the
+  error does not echo it.
+- Each query must start with SELECT or WITH and contain no `;`.
+- Each query then passes two dialect-aware checks in `backend/app/config/sql_safety.py`:
+  1. **Keyword deny-list.** Any unquoted INSERT, UPDATE, DELETE, MERGE, INTO, EXEC, CALL,
+     SET, BEGIN, COMMIT, LOCK, WAITFOR, OPENROWSET, and similar, fails the query. This is
+     needed because T-SQL needs no `;` between statements, and a parser reads
+     `SELECT id FROM t DELETE FROM t` as one SELECT. Quote a column that really has one of
+     these names.
+  2. **Parse with sqlglot**, in the engine's own grammar. The query must be exactly one read
+     query, with no write, `SELECT INTO` or `FOR UPDATE` anywhere in the tree, including in
+     CTEs. SQL that sqlglot can't parse is rejected (fails closed).
+- The query's `:name` placeholders and its `params` must match exactly. Values are always
+  bound by the driver, never formatted into the SQL.
+
+**At sync time.**
+- A fresh, pool-less connection is opened. The URL's engine and driver are checked against
+  `dialect` first.
+- The session is made read-only where the engine supports it, and gets the statement
+  timeout.
+- Each query reads at most `max_rows + 1` rows, in batches of `fetch_batch_size`. The
+  transaction is then rolled back. Nothing is ever committed.
+- An overall deadline backs up the driver timeouts: connect timeout + each query's timeout
+  + 10 s.
+- Every driver or SQLAlchemy error becomes a per-source failure. It is classified as one of:
+  could not connect, authentication failed, timed out, tried to write and was refused, or
+  failed.
+- Before an error is logged or returned, the password, the URL, and the user and host names
+  are removed. The original exception is not chained, so its traceback can't leak them
+  either.
+- A failed source retires nothing. A query that succeeds with zero rows means the source is
+  now empty, so its rows are retired.
+
+**Database permissions.** Use a dedicated login that can only read the tables the queries
+use. The session's read-only mode is the second layer of protection, not the first.
+- PostgreSQL: `CREATE ROLE kb_reader LOGIN PASSWORD '...'`, then `GRANT CONNECT` on the
+  database, `GRANT USAGE` on the schema, and `GRANT SELECT` on the tables. Also run
+  `ALTER ROLE kb_reader SET default_transaction_read_only = on`.
+- MySQL: `CREATE USER 'kb_reader'@'%' IDENTIFIED BY '...'`, then
+  `GRANT SELECT ON hr.<table> TO 'kb_reader'@'%'`, and nothing else.
+- SQL Server: create a login and a database user, then add the user to `db_datareader`, or
+  grant the narrower `GRANT SELECT ON dbo.<table>`. SQL Server has no read-only transaction,
+  so **this grant is the main write protection**. Never use a login that owns the schema or
+  is in `db_owner`.
+- Oracle: `CREATE USER kb_reader IDENTIFIED BY "..."`, then `GRANT CREATE SESSION` and
+  `GRANT SELECT ON owner.<table>`. Never grant `SELECT ANY TABLE`.
+
+**Known engine limitations.**
+- **SQL Server**:
+  - The engine does not enforce a read-only session. A write that somehow got past
+    validation would run, then be rolled back at the end of the sync. The live test shows
+    this with an admin login.
+  - The timeout has 1-second granularity.
+- **MySQL**:
+  - `READ ONLY` still allows writes to `TEMPORARY` tables.
+  - `max_execution_time` covers SELECT statements only.
+  - When the row cap is exceeded, PyMySQL reads the rest of the streamed result before
+    closing. `max_execution_time` still bounds that time.
+  - MariaDB is not supported, because it names the timeout variable differently.
+- **Oracle**:
+  - `call_timeout` limits each round trip, not the whole statement.
+  - When the timeout fires, the driver discards the connection.
+  - Bind numbers, not Python `True`, for `NUMBER(1)` flag columns; on 23ai `True` binds as a
+    `BOOLEAN`.
+  - A table recreated or altered moments before a sync fails that sync with `ORA-01466`,
+    because a READ ONLY transaction can't read DDL newer than its snapshot. The source is
+    reported as failed, nothing is retired, and the next sync works.
+- **All engines**:
+  - Validation can't tell whether a function a query calls has side effects. Only grants and
+    the read-only transaction cover that.
+  - Each sync reads one full snapshot. There is no incremental or keyset pagination, because
+    retiring deleted rows needs the complete key set.
+  - For the thread-based drivers (all except asyncpg), when the overall deadline fires, the
+    sync reports the source as failed straight away. The worker thread finishes at the
+    driver's own timeout.
+
+**Sync and inspect.**
+
+```
+POST /admin/ingest/sync           (admin:ingest permission)
+{"assistant_id": "<assistant>", "tenant_id": "local-development", "source": "employee_directory"}
+```
+
+The response has one entry per source:
+- `status` (`ok` or `failed`) and `error`, the redacted reason.
+- Counts: `discovered`, `created`, `updated`, `unchanged`, `retired` and `chunks_embedded`.
+- The URIs in `failed_items` and `retired_items`.
+
+The logs carry the same redacted error. After you re-sync an unchanged table, every row
+should be `unchanged`, with `chunks_embedded: 0`. To see what is stored, query the
+`documents` rows whose `source_uri` starts with `db://<source name>/` and that have
+`is_current` set.
+
+**Tests.**
+- `tests/test_database_sources.py` needs no network, plus the Postgres test DB for the sync
+  cases. It covers:
+  - config validation per dialect, and the URL and driver checks;
+  - the read-only session setup each dialect issues, batching and the row cap;
+  - error classification using each driver's real exception types, and redaction;
+  - sync behaviour: change detection, retiring, labels, tenant and assistant isolation, and
+    one failing source among working ones.
+- `tests/test_database_engines_live.py` runs against real engines in throwaway containers;
+  the start commands are in its docstring. For each engine it covers:
+  - rows and params, and update and retire on re-sync;
+  - writes blocked for both the SELECT-only login and an admin login;
+  - timeout, row cap and an empty result;
+  - wrong password and an unreachable server.
+
+  ```
+  $env:RUN_LIVE_DB_ENGINE_TESTS = "1"; python -m pytest tests/test_database_engines_live.py
+  ```
+
+**Why not MCP.** Ingestion stays an explicit, admin-triggered sync. A database source only
+fetches its reviewed queries during that sync and exposes nothing to the LLM. Supporting
+more engines needs drivers, not a tool protocol.
+
+MCP fits a different, future feature: an assistant reading live data, or taking approved
+actions, while it answers. That feature would need its own design:
+- **Per-user authorization.** Each tool call runs with the signed-in principal's rights,
+  not the ingestion reader's. The tool layer checks tenant, labels and permissions before
+  every call. The MCP server gets a user-scoped token through token exchange or
+  on-behalf-of, not a shared service account.
+- **Allow-listed tools.** Tools are read-only by default and parameterised, with no free-form
+  SQL. Writes need explicit approval.
+- **Credentials.** They stay in the MCP server's own secret store, never in the model,
+  the prompt or this framework's config.
+- **Auditing.** Every call is audited, as `turn_audit` does for chat turns.
 
 ## Database
 

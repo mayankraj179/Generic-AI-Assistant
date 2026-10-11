@@ -11,10 +11,13 @@ from app.config.knowledge_sources import (
 )
 from app.ingestion.sources.base import KnowledgeSource, SourceError
 from app.ingestion.sources.database import DatabaseSource
+from app.ingestion.sources.dialects import DIALECTS, DatabaseDialect
 from app.ingestion.sources.filesystem import FilesystemSource
 from app.ingestion.sources.object_storage import ObjectStorageSource
 
 __all__ = [
+    "DIALECTS",
+    "DatabaseDialect",
     "DatabaseSource",
     "FilesystemSource",
     "KnowledgeSource",

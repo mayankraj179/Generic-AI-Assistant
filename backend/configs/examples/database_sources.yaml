@@ -1,0 +1,106 @@
+# Example: one database knowledge source per supported engine. NOT loaded
+# (only configs/*.yaml is). Copy the sources you need into an assistant's
+# knowledge_sources block, set the env vars, and install the driver extra:
+#   pip install -e ".[mysql]"   /   ".[mssql]"   /   ".[oracle]"
+# PostgreSQL (asyncpg) needs no extra. See README "Database sources" for each
+# engine's read-only and timeout behaviour and the grants the reader needs.
+assistant_id: database_sources_example
+display_name: Database Sources Example
+description: Reference for database knowledge sources on each supported engine.
+tenant_id: bitwise-global
+
+model:
+  provider: azure_ai
+  model_name: gpt-6-luna
+
+retrieval:
+  enabled: true
+  collection_name: database_sources_example
+  embedding_provider: gemini
+
+knowledge_sources:
+  # PostgreSQL. dialect may be omitted: postgresql is the default.
+  #   HR_PG_URL=postgresql+asyncpg://kb_reader:<password>@db-host:5432/hr
+  - name: pg_employees
+    type: database
+    dialect: postgresql
+    url: ${HR_PG_URL}
+    access_labels: ["role:authenticated"]
+    max_rows: 1000
+    statement_timeout_ms: 5000
+    queries:
+      - name: employee_records
+        key_column: employee_id
+        sql: |
+          SELECT employee_id, department, job_title, hired_on
+          FROM employee_directory
+          WHERE active = :active
+        params:
+          active: true
+
+  # MySQL 8.x. Password kept out of the URL, in its own secret.
+  #   HR_MYSQL_URL=mysql+pymysql://kb_reader@db-host:3306/hr
+  #   HR_MYSQL_PASSWORD=<password>
+  - name: mysql_employees
+    type: database
+    dialect: mysql
+    url: ${HR_MYSQL_URL}
+    password: ${HR_MYSQL_PASSWORD}
+    access_labels: ["role:authenticated"]
+    max_rows: 1000
+    statement_timeout_ms: 5000
+    fetch_batch_size: 200
+    queries:
+      - name: employee_records
+        key_column: employee_id
+        sql: |
+          SELECT employee_id, department, job_title
+          FROM employee_directory
+          WHERE active = :active
+        params:
+          active: true
+
+  # SQL Server. No engine-level read-only mode: the login's grants
+  # (db_datareader or narrower) are the main write protection. Timeout
+  # rounds up to whole seconds.
+  #   HR_MSSQL_URL=mssql+pymssql://kb_reader:<password>@db-host:1433/hr
+  - name: mssql_employees
+    type: database
+    dialect: mssql
+    url: ${HR_MSSQL_URL}
+    access_labels: ["dept:hr"]
+    max_rows: 1000
+    statement_timeout_ms: 5000
+    queries:
+      - name: employee_records
+        key_column: employee_id
+        sql: |
+          SELECT employee_id, department, job_title
+          FROM dbo.employee_directory
+          WHERE active = :active
+        params:
+          active: 1
+
+  # Oracle (python-oracledb thin mode: no Oracle client install).
+  #   HR_ORACLE_URL=oracle+oracledb://kb_reader:<password>@db-host:1521/?service_name=HRPDB
+  - name: oracle_employees
+    type: database
+    dialect: oracle
+    url: ${HR_ORACLE_URL}
+    access_labels: ["dept:hr"]
+    max_rows: 1000
+    statement_timeout_ms: 5000
+    queries:
+      - name: employee_records
+        key_column: employee_id
+        sql: |
+          SELECT employee_id, department, job_title
+          FROM hr_owner.employee_directory
+          WHERE active = :active
+        params:
+          active: 1
+
+enabled_tools: []
+
+system_prompt: >
+  Answer only from the retrieved employee directory content.

@@ -274,7 +274,8 @@ async def test_object_storage_missing_object_is_file_not_found():
 def _db_source(columns, rows, **overrides: Any) -> tuple[DatabaseSource, list]:
     seen: list = []
 
-    async def runner(config, url):
+    async def runner(config, connection):
+        url = connection.url.render_as_string(hide_password=False)
         seen.append((config.queries[0].sql, config.queries[0].params, url))
         return {"office": (columns, rows)}
 
@@ -338,9 +339,9 @@ async def test_database_rejects_unusable_results(db_url, columns, rows, message)
         await source.discover()
 
 
-async def test_database_only_supports_postgres(monkeypatch):
-    from app.ingestion.sources.database import run_read_only_queries
-
-    config = DatabaseSourceConfig.model_validate(_DB)
-    with pytest.raises(SourceError, match="only PostgreSQL"):
-        await run_read_only_queries(config, "mysql+aiomysql://u:p@h/db")
+async def test_database_url_must_match_the_dialect(monkeypatch):
+    # dialect defaults to postgresql, so a MySQL URL is refused before connecting.
+    monkeypatch.setenv("DB_URL", "mysql+pymysql://u:p@h/db")
+    source = DatabaseSource(DatabaseSourceConfig.model_validate(_DB))
+    with pytest.raises(SourceError, match="'mysql' URL but the source's dialect is 'postgresql'"):
+        await source.discover()

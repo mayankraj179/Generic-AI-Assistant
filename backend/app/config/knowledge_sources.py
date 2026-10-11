@@ -3,7 +3,8 @@ assistant's knowledge comes from, so onboarding a data source is YAML only.
 
 Three source types, all read-only: ``filesystem`` (local/uploaded
 documents), ``object_storage`` (S3-compatible: bucket + prefix) and
-``database`` (reviewed, parameterised SELECTs; one document per row).
+``database`` (reviewed, parameterised SELECTs; one document per row, from
+PostgreSQL, MySQL, SQL Server or Oracle, chosen by ``dialect``).
 
 Secrets never appear in YAML. Every credential field takes only an env var
 reference, ``${NAME}``, resolved when a sync runs (so a config still loads
@@ -16,8 +17,11 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.functional_validators import BeforeValidator
+from sqlalchemy import text
+
+from app.config.sql_safety import check_read_only_query
 
 ENV_REF_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -26,6 +30,11 @@ _URL_USERINFO_RE = re.compile(r"^[a-z][a-z0-9+.-]*://[^/@]*@", re.IGNORECASE)
 _SQL_START_RE = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 
 SOURCE_TYPES = ("database", "filesystem", "object_storage")
+
+# The database engines a ``database`` source can read from. Each one is a
+# SQLAlchemy backend name; app/ingestion/sources/dialects.py holds how each
+# enforces read-only access and timeouts.
+DatabaseDialectName = Literal["postgresql", "mysql", "mssql", "oracle"]
 
 
 def _env_ref(value: Any) -> str:
@@ -57,7 +66,9 @@ def _no_url_credentials(value: str | None) -> str | None:
 
 
 class _SourceBase(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # hide_input: a rejected literal secret must not be echoed back, even
+    # when a source is validated on its own rather than via AssistantConfig.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     # Unique within the assistant. Part of every document's source_uri
     # (<type>://<name>/...), which is also what scopes a re-sync's retiring
@@ -116,7 +127,7 @@ class DatabaseQueryConfig(BaseModel):
     and bound parameters are the only way values get into it; nothing is
     ever generated or string-formatted at runtime."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     sql: str
@@ -142,17 +153,41 @@ class DatabaseQueryConfig(BaseModel):
             raise ValueError("query sql must be a single statement (no ';' separators)")
         return sql
 
+    @model_validator(mode="after")
+    def _params_match_placeholders(self) -> DatabaseQueryConfig:
+        # The same :name parsing SQLAlchemy applies when it runs the query.
+        placeholders = set(text(self.sql).compile().params)
+        missing = sorted(placeholders - self.params.keys())
+        unused = sorted(self.params.keys() - placeholders)
+        if missing:
+            raise ValueError(f"query '{self.name}' has no params value for: {', '.join(missing)}")
+        if unused:
+            raise ValueError(
+                f"query '{self.name}' params are not used by its sql: {', '.join(unused)}"
+            )
+        return self
+
 
 class DatabaseSourceConfig(_SourceBase):
     type: Literal["database"]
-    # The full connection URL (it carries the password), e.g.
-    # postgresql+asyncpg://kb_reader:...@host/db. Use a read-only role;
-    # each sync also runs in a READ ONLY transaction.
+    # The engine the URL points at. It picks the grammar the queries are
+    # validated against and how read-only access and the timeout are
+    # enforced, and must match the URL's scheme (checked at sync time).
+    # Defaults to postgresql, the only engine before dialects existed.
+    dialect: DatabaseDialectName = "postgresql"
+    # The connection URL, e.g. mysql+pymysql://kb_reader:...@host/db. It may
+    # carry the password, or leave it out and set ``password`` instead (for a
+    # secret store that hands out the password on its own). Use a login that
+    # can only SELECT; see the README for each engine's read-only behaviour.
     url: EnvRef
+    password: EnvRef | None = None
     queries: list[DatabaseQueryConfig] = Field(min_length=1)
     # Per query: more rows than this fails the sync rather than truncating.
     max_rows: int = Field(default=5000, gt=0, le=100_000)
     statement_timeout_ms: int = Field(default=15_000, gt=0, le=300_000)
+    # Rows pulled per round trip while reading a result (server-side cursor
+    # where the driver has one). Bounds client memory per fetch.
+    fetch_batch_size: int = Field(default=500, gt=0, le=10_000)
 
     @field_validator("queries")
     @classmethod
@@ -161,6 +196,15 @@ class DatabaseSourceConfig(_SourceBase):
         if len(names) != len(set(names)):
             raise ValueError("query names must be unique within a database source")
         return v
+
+    @model_validator(mode="after")
+    def _queries_are_read_only_for_dialect(self) -> DatabaseSourceConfig:
+        for query in self.queries:
+            try:
+                check_read_only_query(query.sql, self.dialect)
+            except ValueError as exc:
+                raise ValueError(f"query '{query.name}': {exc}") from None
+        return self
 
 
 KnowledgeSourceConfig = Annotated[

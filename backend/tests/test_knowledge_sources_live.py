@@ -18,7 +18,11 @@ import pytest
 from dotenv import dotenv_values
 from sqlalchemy.engine import make_url
 
-from app.config.knowledge_sources import DatabaseSourceConfig, ObjectStorageSourceConfig
+from app.config.knowledge_sources import (
+    DatabaseQueryConfig,
+    DatabaseSourceConfig,
+    ObjectStorageSourceConfig,
+)
 from app.config.loader import load_all_assistant_configs
 from app.db.models import EMBEDDING_DIM
 from app.ingestion.sources import DatabaseSource, ObjectStorageSource, SourceError, build_source
@@ -129,29 +133,42 @@ async def test_live_minio_reader_cannot_write():
         source._s3().put_object(Bucket="kb-demo", Key="policies/x.md", Body=b"x")
 
 
-def _admin_db_source(monkeypatch, sql: str, **overrides) -> DatabaseSource:
+def _admin_db_source(monkeypatch, sql: str, *, validate: bool = True, **overrides):
     # The admin role CAN write, so this proves the READ ONLY transaction
     # itself blocks writes, independent of the reader role's grants.
     admin_url = make_url(_env("DATABASE_URL")).set(database="kb_demo_source")
     monkeypatch.setenv("KB_LIVE_ADMIN_DB_URL", admin_url.render_as_string(hide_password=False))
-    config = DatabaseSourceConfig.model_validate(
-        {
-            "name": "admin_db",
-            "type": "database",
-            "url": "${KB_LIVE_ADMIN_DB_URL}",
-            "access_labels": ["scope:development"],
-            "queries": [{"name": "q", "key_column": "office_code", "sql": sql}],
-            **overrides,
-        }
+    data = {
+        "name": "admin_db",
+        "type": "database",
+        "url": "${KB_LIVE_ADMIN_DB_URL}",
+        "access_labels": ["scope:development"],
+        "queries": [{"name": "q", "key_column": "office_code", "sql": sql}],
+        **overrides,
+    }
+    if validate:
+        return DatabaseSource(DatabaseSourceConfig.model_validate(data))
+    # Skips config validation, which would refuse a write before it ever
+    # reached the database, to test the database's own layer.
+    query = DatabaseQueryConfig.model_construct(**data.pop("queries")[0], params={})
+    return DatabaseSource(
+        DatabaseSourceConfig.model_construct(
+            **{**data, "access_labels": frozenset(data["access_labels"])},
+            queries=[query],
+            dialect="postgresql",
+            password=None,
+            max_rows=5000,
+            statement_timeout_ms=15_000,
+            fetch_batch_size=500,
+        )
     )
-    return DatabaseSource(config)
 
 
 async def test_live_database_write_through_a_cte_is_blocked_by_read_only(monkeypatch):
-    source = _admin_db_source(
-        monkeypatch,
-        "WITH d AS (DELETE FROM office_directory RETURNING office_code) SELECT * FROM d",
-    )
+    sql = "WITH d AS (DELETE FROM office_directory RETURNING office_code) SELECT * FROM d"
+    with pytest.raises(ValueError, match="not allowed in a read query: DELETE"):
+        _admin_db_source(monkeypatch, sql)  # first layer: config validation
+    source = _admin_db_source(monkeypatch, sql, validate=False)
     with pytest.raises(SourceError, match="read-only transaction"):
         await source.discover()
     rows = await _admin_db_source(

@@ -19,3 +19,7 @@ top level of `configs/`. They are kept as ready-made starting points.
 
 The active assistants (`configs/hr_assistant.yaml`,
 `configs/finance_assistant.yaml`) use Azure AI `gpt-6-luna` for chat.
+- `database_sources.yaml` — reference config with one `database` knowledge
+  source per supported engine (PostgreSQL, MySQL, SQL Server, Oracle). Not an
+  assistant to activate as-is; copy the sources you need. Covered by
+  `tests/test_database_sources.py`, which checks that it validates.

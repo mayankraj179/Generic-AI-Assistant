@@ -23,6 +23,9 @@ dependencies = [
     "openpyxl>=3.1.0",
     # object_storage knowledge sources (S3 and S3-compatible stores like MinIO).
     "boto3>=1.35.0",
+    # database knowledge sources: validates each reviewed query, in its
+    # engine's grammar, as a single read query (app/config/sql_safety.py).
+    "sqlglot>=25.0.0",
     # Python's stdlib zoneinfo has no bundled IANA database on Windows (or
     # any system lacking /usr/share/zoneinfo) — confirmed live: ZoneInfo("UTC")
     # itself raised ZoneInfoNotFoundError on this dev machine before adding
@@ -53,6 +56,13 @@ dev = [
     "ruff>=0.6.9",
     "mypy>=1.11.2",
 ]
+# Drivers for database knowledge sources beyond PostgreSQL (asyncpg is a
+# core dependency). Install only the engines you ingest from, e.g.
+# pip install -e ".[mysql]". Versions listed are the ones tested.
+mysql = ["pymysql>=1.1.0"]       # tested with PyMySQL 1.2.3 against MySQL 8.4
+mssql = ["pymssql>=2.3.0"]       # tested with pymssql 2.4.3 against SQL Server 2022
+oracle = ["oracledb>=2.0.0"]     # tested with python-oracledb 26.0.1 (thin) against Oracle 23ai Free
+databases = ["pymysql>=1.1.0", "pymssql>=2.3.0", "oracledb>=2.0.0"]
 # Only needed to export traces (OTEL_TRACES_EXPORTER=otlp, e.g. to local
 # Jaeger). Pinned to the opentelemetry-api/sdk version google-adk installs.
 tracing = ["opentelemetry-exporter-otlp-proto-http==1.42.1"]
