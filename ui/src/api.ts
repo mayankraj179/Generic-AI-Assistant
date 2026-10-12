@@ -12,6 +12,14 @@ export interface Citation {
   chunkIndex: number;
 }
 
+/** A connector whose live data backs a reply (e.g. the HR system). Not a
+ * document citation: `grounded` still refers to documents only. */
+export interface LiveSource {
+  connector: string;
+  displayName: string;
+  fetchedAt: string;
+}
+
 export type ChartType = "bar" | "line" | "pie";
 
 export interface ChartSeries {
@@ -33,6 +41,7 @@ export interface ChatReply {
   conversationId: string;
   grounded: boolean;
   chart?: Chart;
+  liveSources: LiveSource[];
 }
 
 export interface PostChatParams {
@@ -97,6 +106,20 @@ interface ChatResponseDto {
   citations: CitationDto[];
   grounded: boolean;
   chart?: ChartDto | null;
+  live_sources?: LiveSourceDto[];
+}
+
+interface LiveSourceDto {
+  connector: string;
+  display_name: string;
+  fetched_at: string;
+}
+
+function toLiveSources(dtos: unknown): LiveSource[] {
+  if (!Array.isArray(dtos)) return [];
+  return dtos
+    .filter((d): d is LiveSourceDto => Boolean(d) && typeof d.display_name === "string")
+    .map((d) => ({ connector: d.connector, displayName: d.display_name, fetchedAt: d.fetched_at }));
 }
 
 interface MessageDto {
@@ -202,6 +225,7 @@ export async function postChat(
     conversationId: data.conversation_id,
     grounded: data.grounded,
     chart: data.chart ? toChart(data.chart) : undefined,
+    liveSources: toLiveSources(data.live_sources),
   };
 }
 
@@ -220,6 +244,7 @@ interface DoneEventDto {
   conversation_id: string;
   citations: CitationDto[];
   grounded: boolean;
+  live_sources?: LiveSourceDto[];
 }
 
 interface ErrorEventDto {
@@ -251,6 +276,7 @@ function parseStreamEventDto(raw: unknown): StreamEventDto | undefined {
       conversation_id: done.conversation_id,
       citations: Array.isArray(done.citations) ? done.citations : [],
       grounded: Boolean(done.grounded),
+      live_sources: Array.isArray(done.live_sources) ? done.live_sources : [],
     };
   }
   if (type === "error" && "detail" in raw && typeof (raw as ErrorEventDto).detail === "string") {
@@ -269,7 +295,12 @@ export interface PostChatStreamParams extends PostChatParams {
    * should treat the gap between the last delta and this call (or onDone,
    * if no chart applies) as a possible "generating chart..." period. */
   onChart?: (chart: Chart) => void;
-  onDone: (result: { conversationId: string; citations: Citation[]; grounded: boolean }) => void;
+  onDone: (result: {
+    conversationId: string;
+    citations: Citation[];
+    grounded: boolean;
+    liveSources: LiveSource[];
+  }) => void;
   onError: (detail: string) => void;
   /** Called instead of onError when the backend answers 401 (token
    * rejected), so the caller can end the session rather than keep sending
@@ -389,6 +420,7 @@ export async function postChatStream(
         conversationId: event.conversation_id,
         citations: event.citations.map(toCitation),
         grounded: event.grounded,
+        liveSources: toLiveSources(event.live_sources),
       });
     } else {
       sawDone = true;

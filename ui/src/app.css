@@ -459,6 +459,24 @@ button:focus-visible, select:focus-visible, textarea:focus-visible {
   text-transform: capitalize;
 }
 .source-chip svg { color: var(--accent); }
+.live-sources { display: flex; flex-wrap: wrap; gap: 6px; }
+.live-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #2f9e44;
+}
+
 .badge-ungrounded {
   margin-right: auto;
   padding: 3px 9px;

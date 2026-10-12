@@ -106,7 +106,7 @@ export function useChatSession({ getToken, onSessionExpired, onTurnSaved }: Chat
         onDone: (result) => {
           if (stale()) return;
           setConversationId(result.conversationId);
-          patch(replyId, (m) => ({ ...m, streaming: false, citations: result.citations, grounded: result.grounded }));
+          patch(replyId, (m) => ({ ...m, streaming: false, citations: result.citations, grounded: result.grounded, liveSources: result.liveSources }));
           onTurnSaved({ id: result.conversationId, assistantId, firstMessage: text });
         },
         onError: (detail) => {

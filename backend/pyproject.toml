@@ -26,6 +26,9 @@ dependencies = [
     # database knowledge sources: validates each reviewed query, in its
     # engine's grammar, as a single read query (app/config/sql_safety.py).
     "sqlglot>=25.0.0",
+    # connectors: validates model-supplied arguments against each operation's
+    # input schema (app/connectors/runtime.py).
+    "jsonschema>=4.0",
     # Python's stdlib zoneinfo has no bundled IANA database on Windows (or
     # any system lacking /usr/share/zoneinfo) — confirmed live: ZoneInfo("UTC")
     # itself raised ZoneInfoNotFoundError on this dev machine before adding

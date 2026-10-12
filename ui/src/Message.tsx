@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { Chart, Citation } from "./api";
+import type { Chart, Citation, LiveSource } from "./api";
 import { ChartView } from "./ChartView";
 import { Markdown } from "./Markdown";
 
@@ -10,6 +10,7 @@ export interface DisplayMessage {
   citations?: Citation[];
   chart?: Chart;
   grounded?: boolean;
+  liveSources?: LiveSource[];
   streaming?: boolean;
 }
 
@@ -25,6 +26,27 @@ function Sources({ citations }: { citations: Citation[] }) {
           {title.replace(/_/g, " ")}
         </span>
       ))}
+    </div>
+  );
+}
+
+/** "Source: HR system, live" — data fetched from a connector at question
+ * time. Shown alongside document sources, never as one of them. */
+function LiveSources({ sources }: { sources: LiveSource[] }) {
+  return (
+    <div className="live-sources">
+      {sources.map((s) => {
+        const at = new Date(s.fetchedAt);
+        const time = Number.isNaN(at.getTime())
+          ? ""
+          : at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        return (
+          <span className="live-source" key={s.connector} title={time ? `Fetched at ${time}` : undefined}>
+            <span className="live-dot" aria-hidden />
+            Source: {s.displayName}, live{time ? ` (${time})` : ""}
+          </span>
+        );
+      })}
     </div>
   );
 }
@@ -94,6 +116,9 @@ export function Message({ message, assistantName }: { message: DisplayMessage; a
           <div className="msg-footer">
             {message.citations && message.citations.length > 0 && (
               <Sources citations={message.citations} />
+            )}
+            {message.liveSources && message.liveSources.length > 0 && (
+              <LiveSources sources={message.liveSources} />
             )}
             {/* grounded=false also covers correct tool-only answers (e.g. a
                 calculation with nothing retrieved), so don't claim "not found". */}

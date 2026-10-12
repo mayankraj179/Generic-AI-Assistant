@@ -5,6 +5,7 @@ import re
 from datetime import date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.connectors.runtime import current_turn
 from app.core.tool_definition import ToolDefinition, ToolKind
 from app.observability.audit import record_tool_call
 from app.observability.tracing import start_span
@@ -288,6 +289,22 @@ _TOOL_FUNCTIONS = {
 }
 
 
+def tool_definition(name: str) -> ToolDefinition | None:
+    """The definition a provider declares to the model for ``name``: a
+    built-in tool, or one of the current turn's connector operations that
+    the caller is authorized for (app/connectors/runtime.py). None otherwise."""
+    definition = TOOL_REGISTRY.get(name)
+    if definition is not None:
+        return definition
+    turn = current_turn()
+    return turn.definition(name) if turn is not None else None
+
+
+def is_connector_tool(name: str) -> bool:
+    turn = current_turn()
+    return turn is not None and turn.is_connector_tool(name)
+
+
 async def execute_tool(name: str, arguments: dict) -> dict:
     """The single dispatch point both providers resolve tool calls through:
     GeminiProvider indirectly (FunctionTool wraps these same functions and
@@ -302,6 +319,12 @@ async def execute_tool(name: str, arguments: dict) -> dict:
     structured error back to the model instead" discipline the tool
     implementations themselves already apply to malformed input values.
     """
+    # Connector operations trace and audit themselves, without arguments or
+    # results (they can carry identity and personal data); see runtime.py.
+    turn = current_turn()
+    if turn is not None and turn.is_connector_tool(name):
+        return await turn.execute(name, arguments)
+
     # Traced and audited here for the OpenRouter/xAI tool loops. Gemini's
     # tools are invoked by google-adk directly, which traces them itself
     # (execute_tool spans); GeminiProvider audits them from ADK events.

@@ -12,6 +12,7 @@ import os
 from datetime import UTC, datetime
 
 from app.observability.context import current_context
+from app.observability.redaction import redact
 
 # Attributes every LogRecord has; anything else was passed via `extra=`.
 _STANDARD_ATTRS = set(vars(logging.makeLogRecord({}))) | {"message", "asctime", "taskName"}
@@ -83,6 +84,18 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, ensure_ascii=False)
 
 
+class RedactingFormatter(logging.Formatter):
+    """Masks credentials in the final line (message, extras and traceback
+    alike), so nothing a handler writes can carry a token or secret."""
+
+    def __init__(self, inner: logging.Formatter) -> None:
+        super().__init__()
+        self._inner = inner
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(self._inner.format(record))
+
+
 class TextFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         ts = datetime.fromtimestamp(record.created, tz=UTC).strftime("%H:%M:%S.%f")[:-3]
@@ -108,7 +121,9 @@ def configure_logging(level: str | None = None, fmt: str | None = None) -> None:
             root.removeHandler(handler)
     handler = logging.StreamHandler()
     handler._assistant_framework = True  # type: ignore[attr-defined]
-    handler.setFormatter(TextFormatter() if fmt_name == "text" else JsonFormatter())
+    handler.setFormatter(
+        RedactingFormatter(TextFormatter() if fmt_name == "text" else JsonFormatter())
+    )
     handler.addFilter(ContextFilter())
     root.addHandler(handler)
 

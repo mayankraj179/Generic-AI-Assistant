@@ -66,6 +66,7 @@ class JwtAuthProvider:
             principal_id=identity.subject,
             labels=frozenset(labels),
             clearance=1,
+            claims=identity.identity_claims,
         )
 
     def validate_token(self, token: str) -> AuthenticatedIdentity:

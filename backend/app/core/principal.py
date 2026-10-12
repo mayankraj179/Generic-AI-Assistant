@@ -19,6 +19,11 @@ class PrincipalContext(BaseModel):
     principal_id: str
     labels: frozenset[str] = Field(default_factory=frozenset)
     clearance: int = 0
+    # Scalar claims from the validated token (e.g. preferred_username, email,
+    # an employee_id mapper). Server-side only: a connector maps one of these
+    # to the external system's user id (app/connectors/runtime.py). Never
+    # shown to the model and never taken from anything the model sends.
+    claims: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("labels", mode="before")
     @classmethod

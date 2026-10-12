@@ -1,0 +1,81 @@
+assistant_id: hr_live_assistant
+display_name: HR Assistant (live leave balance)
+description: >
+  Example of a document source plus a live connector: answers leave-policy
+  questions from the ingested policy, and the asking employee's current leave
+  balance live from the HR system (mock: scripts/mock_hr_api.py).
+tenant_id: bitwise-global
+
+model:
+  provider: azure_ai
+  model_name: gpt-6-luna
+  supports_tools: true
+  supports_streaming: true
+  thinking_level: null
+  configurable_thinking: false
+  max_context_tokens: 128000
+
+retrieval:
+  enabled: true
+  collection_name: hr_live_docs
+  exact_search_threshold: 500
+  top_k: 8
+  # Same Gemini embedding model and cutoff as hr_assistant (measured there);
+  # re-measure if this corpus grows.
+  min_similarity: 0.66
+  embedding_provider: gemini
+
+# The leave policy: entitlements and rules, quoted with citations.
+knowledge_sources:
+  - name: leave_policy
+    type: filesystem
+    path: sample_sources/hr_live
+    access_labels: ["role:authenticated"]
+
+# Live, read-only lookups at question time. Each allowed operation is offered
+# to the model as a tool, only to callers holding ALL of its required_labels.
+# Secrets are ${ENV_VAR} references only; a literal value fails config loading.
+connectors:
+  - name: hr_system
+    type: hr_api
+    display_name: HR system
+    base_url: http://127.0.0.1:8099
+    auth:
+      method: oauth_client_credentials
+      token_url: http://127.0.0.1:8099/oauth/token
+      client_id: ${HR_API_CLIENT_ID}
+      client_secret: ${HR_API_CLIENT_SECRET}
+    # The validated JWT claim holding the user's id in the HR system. It is
+    # injected server-side; the model can't see or change it. (In production
+    # this would typically be an employee_id claim from an IdP mapper.)
+    identity:
+      claim: preferred_username
+    operations:
+      - name: get_leave_balance
+        # Every authenticated dev user holds these today (see README); a real
+        # deployment would require something like role:employee.
+        required_labels: ["role:authenticated", "scope:development"]
+        timeout_seconds: 3
+
+enabled_tools: []
+max_tool_calls: 4
+
+guardrails:
+  prompt_injection_screening: true
+  input_pii_block: false
+  output_pii_block: false
+  max_input_chars: 4000
+  unsafe_output_patterns: []
+
+system_prompt: >
+  You are an HR assistant. Answer policy questions only from the retrieved
+  policy content, and questions about the user's own current leave balance
+  only from the HR system tool. When a question needs both (for example how
+  much of the user's balance they can carry forward), use both and keep them
+  distinct: say what the policy says, then what the user's live balance is.
+  Never invent policy details or balances. Do not write citation markers,
+  source tags or bracketed references in the reply; the application lists the
+  sources separately. Do not open with hedges like "Based on the provided
+  content".
+
+min_clearance: 0

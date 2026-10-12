@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -45,6 +46,17 @@ class ChartOut(BaseModel):
     source_chunks: list[Citation]
 
 
+class LiveSourceOut(BaseModel):
+    """A connector whose live data backs the reply (e.g. the HR system).
+    Separate from citations: it is not a document, and ``grounded`` keeps
+    meaning "backed by retrieved documents" only."""
+
+    connector: str
+    display_name: str
+    operations: list[str]
+    fetched_at: datetime
+
+
 class ChatResponse(BaseModel):
     assistant_id: str
     reply: str
@@ -52,6 +64,7 @@ class ChatResponse(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     grounded: bool = False
     chart: ChartOut | None = None
+    live_sources: list[LiveSourceOut] = Field(default_factory=list)
 
 
 class CreateSessionRequest(BaseModel):

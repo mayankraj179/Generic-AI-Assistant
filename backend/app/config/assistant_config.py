@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.config.connectors import ConnectorConfig, check_unique_connector_names
 from app.config.knowledge_sources import (
     KnowledgeSourceConfig,
     check_source_types,
@@ -129,6 +130,10 @@ class AssistantConfig(BaseModel):
     # POST /admin/ingest/sync. Empty means content arrives some other way
     # (e.g. one file at a time through /admin/ingest).
     knowledge_sources: list[KnowledgeSourceConfig] = Field(default_factory=list)
+    # Live, read-only lookups against external systems at question time
+    # (app/config/connectors.py). Each allowed operation is offered to the
+    # model as a tool, only to callers holding its required labels.
+    connectors: list[ConnectorConfig] = Field(default_factory=list)
     named_queries: list[NamedQuery] = Field(default_factory=list)
     enabled_tools: list[str] = Field(default_factory=list)
     # Hard cap on tool-call round-trips a provider may make while producing
@@ -175,3 +180,16 @@ class AssistantConfig(BaseModel):
                 f"(known tools: {', '.join(sorted(TOOL_REGISTRY))})"
             )
         return v
+
+    @field_validator("connectors")
+    @classmethod
+    def _unique_connector_names(cls, v: list[ConnectorConfig]) -> list[ConnectorConfig]:
+        return check_unique_connector_names(v)
+
+    @model_validator(mode="after")
+    def _connector_tools_do_not_shadow_builtins(self) -> AssistantConfig:
+        for connector in self.connectors:
+            clashes = sorted(set(connector.tool_names()) & set(TOOL_REGISTRY))
+            if clashes:
+                raise ValueError(f"connector tool name(s) clash with built-in tools: {clashes}")
+        return self

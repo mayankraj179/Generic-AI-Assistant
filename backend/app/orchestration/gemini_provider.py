@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from app.core.tool_definition import ToolDefinition
 from app.observability.audit import record_provider_call, record_tokens, record_tool_call
 from app.observability.provider_errors import (
     classify_exception,
@@ -22,7 +23,14 @@ from app.orchestration.model_provider import (
     ModelReply,
     ModelStreamEvent,
 )
-from app.tools.builtin import TOOL_REGISTRY, calculate, current_datetime
+from app.tools.builtin import (
+    TOOL_REGISTRY,
+    calculate,
+    current_datetime,
+    execute_tool,
+    is_connector_tool,
+    tool_definition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,22 +56,52 @@ _TOOL_FUNCTIONS_BY_NAME = {
 }
 
 
-def _build_function_tools(enabled_tools: tuple[str, ...], FunctionTool: Any) -> list[Any]:
-    """Resolves GroundedPrompt.enabled_tools into google-adk FunctionTool
+def _build_function_tools(
+    enabled_tools: tuple[str, ...], FunctionTool: Any, BaseTool: Any = None
+) -> list[Any]:
+    """Resolves GroundedPrompt.enabled_tools into google-adk tool
     instances. Silently skips any name not in TOOL_REGISTRY/
     _TOOL_FUNCTIONS_BY_NAME rather than raising — AssistantConfig's own
     field_validator (app/config/assistant_config.py) already rejects an
     unknown tool name at config-load time, long before a request reaches
     here, so this is defense in depth, not the primary validation point.
+
+    Connector operations have no Python signature for FunctionTool to read,
+    so they are wrapped in a BaseTool that declares their JSON schema (with
+    identity params already stripped) and dispatches through execute_tool.
     """
     tools = []
     for name in enabled_tools:
         if name not in TOOL_REGISTRY:
+            definition = tool_definition(name) if BaseTool is not None else None
+            if definition is not None and is_connector_tool(name):
+                tools.append(_connector_tool(definition, BaseTool))
             continue
         func = _TOOL_FUNCTIONS_BY_NAME.get(name)
         if func is not None:
             tools.append(FunctionTool(func))
     return tools
+
+
+def _connector_tool(definition: ToolDefinition, BaseTool: Any) -> Any:
+    from google.genai import types as genai_types
+
+    class ConnectorTool(BaseTool):
+        def __init__(self) -> None:
+            super().__init__(name=definition.name, description=definition.description)
+
+        def _get_declaration(self) -> Any:
+            return genai_types.FunctionDeclaration(
+                name=definition.name,
+                description=definition.description,
+                parameters_json_schema=definition.input_schema,
+            )
+
+        async def run_async(self, *, args: dict[str, Any], tool_context: Any) -> Any:
+            # Traced and audited inside the connector runtime.
+            return await execute_tool(definition.name, dict(args or {}))
+
+    return ConnectorTool()
 
 
 # Structured-output schema for the chart-extraction call — a Pydantic model
@@ -165,14 +203,14 @@ class GeminiProvider:
             from google.adk.events.event import Event
             from google.adk.models.google_llm import Gemini
             from google.adk.runners import InMemoryRunner
-            from google.adk.tools import FunctionTool
+            from google.adk.tools import BaseTool, FunctionTool
             from google.genai import types as genai_types
         except ImportError as exc:  # pragma: no cover - depends on optional SDK
             raise ModelProviderError(
                 "Google ADK / google-genai SDK is not installed"
             ) from exc
 
-        tools = _build_function_tools(prompt.enabled_tools, FunctionTool)
+        tools = _build_function_tools(prompt.enabled_tools, FunctionTool, BaseTool)
         # Tool calls happen as extra LLM round-trips *inside* this same
         # run_async() call (google-adk's Runner executes each proposed
         # FunctionTool call and feeds the result back internally — no
@@ -240,14 +278,14 @@ class GeminiProvider:
             from google.adk.events.event import Event
             from google.adk.models.google_llm import Gemini
             from google.adk.runners import InMemoryRunner
-            from google.adk.tools import FunctionTool
+            from google.adk.tools import BaseTool, FunctionTool
             from google.genai import types as genai_types
         except ImportError as exc:  # pragma: no cover - depends on optional SDK
             raise ModelProviderError(
                 "Google ADK / google-genai SDK is not installed"
             ) from exc
 
-        tools = _build_function_tools(prompt.enabled_tools, FunctionTool)
+        tools = _build_function_tools(prompt.enabled_tools, FunctionTool, BaseTool)
 
         # StreamingMode.SSE is what actually makes run_async yield incremental
         # partial-text events instead of one blocking final event — verified
@@ -456,6 +494,8 @@ class GeminiProvider:
                 completion_tokens=completion,
             )
         for response in event.get_function_responses() or []:
+            if is_connector_tool(response.name or ""):
+                continue  # the connector runtime already recorded it
             result = response.response if isinstance(response.response, dict) else {}
             error = result.get("error")
             record_tool_call(

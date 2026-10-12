@@ -171,6 +171,35 @@ def record_tool_call(
             recorder.tool_results.append(result)
 
 
+def record_connector_call(
+    tool: str,
+    *,
+    connector: str,
+    operation: str,
+    outcome: str,
+    latency_ms: int,
+    values: dict[str, Any] | None = None,
+) -> None:
+    """One connector call in the audit row: which connector and operation,
+    the outcome category and latency. Never arguments, returned values or
+    credentials. ``values`` (the returned scalars, flattened) is kept only in
+    memory for ChatOrchestrator._require_tool_result, like tool_results."""
+    recorder = _current.get()
+    if recorder is not None:
+        recorder.tool_calls.append(
+            {
+                "name": tool,
+                "ok": outcome == "ok",
+                "connector": connector,
+                "operation": operation,
+                "outcome": outcome,
+                "latency_ms": latency_ms,
+            }
+        )
+        if outcome == "ok" and values is not None:
+            recorder.tool_results.append(values)
+
+
 def record_guardrail(action: str, **detail: Any) -> None:
     recorder = _current.get()
     if recorder is not None:

@@ -18,6 +18,8 @@ class AuthenticatedIdentity(BaseModel):
     roles: frozenset[str] = Field(default_factory=frozenset)
     groups: frozenset[str] = Field(default_factory=frozenset)
     raw_claims: dict[str, Any] = Field(default_factory=dict)
+    # Every top-level string/number claim, for connector identity mapping.
+    identity_claims: dict[str, str] = Field(default_factory=dict)
 
     @classmethod
     def from_claims(cls, claims: Mapping[str, Any]) -> AuthenticatedIdentity:
@@ -64,6 +66,11 @@ class AuthenticatedIdentity(BaseModel):
                 "name": claims.get("name"),
                 "groups": list(groups),
                 "roles": list(roles),
+            },
+            identity_claims={
+                str(key): str(value)
+                for key, value in claims.items()
+                if isinstance(value, str | int) and not isinstance(value, bool)
             },
         )
 

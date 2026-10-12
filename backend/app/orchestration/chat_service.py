@@ -8,10 +8,12 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from opentelemetry import trace
 
 from app.config.assistant_config import AssistantConfig
 from app.config.settings import Settings
+from app.connectors.runtime import LiveSource, TurnConnectors, bind_turn, current_turn
 from app.core.principal import PrincipalContext
 from app.guardrails import input as input_guardrails
 from app.guardrails import output as output_guardrails
@@ -117,6 +119,34 @@ CHART_WITHOUT_CONTEXT_GUIDANCE = (
     "from the documents."
 )
 
+# Appended to system_prompt only on a turn that offers connector tools, so
+# assistants without connectors are unaffected. Identity is enforced in code
+# (app/connectors/runtime.py); this only keeps the model from promising
+# lookups it can't do, or guessing when a lookup fails.
+CONNECTOR_TOOL_GUIDANCE = (
+    "Some of your tools fetch live data from an external system. They only "
+    "ever return data about the signed-in user; you cannot look up anyone "
+    "else, so if asked about another person, say that you can only show the "
+    "user's own data. If a live-data tool returns an error, say that the "
+    "system couldn't be reached and do not estimate, infer or guess the value "
+    "(policy documents describe entitlements, not a person's current balance)."
+)
+
+# Replaces the model's reply on a no-document-context turn where a connector
+# could not be reached and no tool call succeeded (see _require_tool_result).
+CONNECTOR_UNREACHABLE_REPLY = (
+    "I couldn't reach the live data source ({sources}) just now, so I can't "
+    "give you that information. Please try again in a few minutes."
+)
+
+# Appended to a reply that stands (it had document context, or another tool
+# succeeded) when a connector failed this turn and never succeeded, so the
+# answer always says the system couldn't be reached.
+CONNECTOR_UNREACHABLE_NOTICE = (
+    "Note: I couldn't reach the live data source ({sources}) just now, so "
+    "this answer doesn't include live data from it."
+)
+
 OUTPUT_GUARDRAIL_FALLBACK_REPLY = (
     "I can't share that response as generated. Please rephrase your "
     "question, or contact support if you believe this is an error."
@@ -136,6 +166,9 @@ class ChatResult:
     citations: tuple[ChunkCitation, ...] = ()
     grounded: bool = False
     chart: ChartSpec | None = None
+    # Connectors whose live data backs this reply. Not citations: grounded
+    # still means "backed by retrieved documents" only.
+    live_sources: tuple[LiveSource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,6 +194,7 @@ class ChatStreamDone:
     conversation_id: uuid.UUID
     citations: tuple[ChunkCitation, ...] = ()
     grounded: bool = False
+    live_sources: tuple[LiveSource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -270,6 +304,10 @@ class _StreamingMarkupStripper:
         return cleaned
 
 
+def _join_names(names: Sequence[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
 def _message_requests_chart(message: str, patterns: Sequence[str]) -> bool:
     """Deterministic, cheap chart-intent gate — a small keyword/pattern set,
     not a classifier or a second model call. False means chart generation
@@ -346,8 +384,11 @@ class ChatOrchestrator:
         conversation_store: ConversationStore | None = None,
         embedding_provider_factory: EmbeddingProviderFactory | None = None,
         audit_store: AuditStore | None = None,
+        connector_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._retrieval_service = retrieval_service
+        # Tests inject an httpx.MockTransport; None means real HTTP.
+        self._connector_transport = connector_transport
         self._provider_factory = provider_factory
         self._conversation_store = conversation_store or ConversationStore()
         # None disables the per-turn audit row (unit tests stay DB-free);
@@ -388,6 +429,11 @@ class ChatOrchestrator:
             conversation_id=conversation_id,
         )
         audit.bind(recorder)
+        # Every turn binds its own connectors, bound to this principal, even
+        # when the config has none: nothing from an earlier turn can leak in.
+        bind_turn(
+            TurnConnectors(principal, config.connectors, transport=self._connector_transport)
+        )
         return recorder
 
     def _note_failure(self, recorder: TurnRecorder, exc: BaseException) -> None:
@@ -555,6 +601,9 @@ class ChatOrchestrator:
         )
         if recorder is not None:
             recorder.outcome = "output_rejected" if guarded.rejected else "answered"
+        reply_out, live_sources = (
+            (guarded.text, ()) if guarded.rejected else self._connector_provenance(guarded.text)
+        )
 
         chart = self._validate_chart(
             chart=reply.chart, grounded=guarded.grounded, chunks=setup.chunks
@@ -569,16 +618,17 @@ class ChatOrchestrator:
             conversation_id=setup.conversation.id,
             principal=principal,
             user_message=message,
-            reply_text=guarded.text,
+            reply_text=reply_out,
             citations=citations,
         )
 
         return ChatResult(
-            text=guarded.text,
+            text=reply_out,
             conversation_id=setup.conversation.id,
             citations=citations,
             grounded=guarded.grounded,
             chart=chart,
+            live_sources=live_sources,
         )
 
     async def handle_stream(
@@ -781,6 +831,7 @@ class ChatOrchestrator:
             yield ChatStreamError(detail="the assistant's response could not be delivered")
             return
         recorder.outcome = "answered"
+        reply_out, live_sources = self._connector_provenance(guarded.text)
 
         chart = self._validate_chart(
             chart=final_chart, grounded=guarded.grounded, chunks=setup.chunks
@@ -795,12 +846,15 @@ class ChatOrchestrator:
             conversation_id=setup.conversation.id,
             principal=principal,
             user_message=message,
-            reply_text=guarded.text,
+            reply_text=reply_out,
             citations=citations,
         )
 
         if hold_back:
-            yield ChatStreamDelta(text=guarded.text)
+            yield ChatStreamDelta(text=reply_out)
+        elif reply_out != guarded.text:
+            # Only the appended connector notice; the reply itself already streamed.
+            yield ChatStreamDelta(text=reply_out[len(guarded.text):])
         if chart is not None:
             yield ChatStreamChart(chart=chart)
 
@@ -808,6 +862,7 @@ class ChatOrchestrator:
             conversation_id=setup.conversation.id,
             citations=citations,
             grounded=guarded.grounded,
+            live_sources=live_sources,
         )
 
     async def _prepare_turn(
@@ -884,6 +939,12 @@ class ChatOrchestrator:
             ConversationTurn(role=m.role, content=m.content) for m in prior_messages
         )
 
+        # Connector operations are tools like any other, offered only when
+        # this caller holds their required labels (checked again at call time).
+        turn_connectors = current_turn()
+        connector_tools = turn_connectors.authorized_tool_names() if turn_connectors else []
+        tool_names = (*config.enabled_tools, *connector_tools)
+
         retrieval_enabled = config.retrieval is not None and config.retrieval.enabled
         chunks: list[Chunk] = []
         chart_trigger_matched = _message_requests_chart(message, config.chart_trigger_patterns)
@@ -919,7 +980,7 @@ class ChatOrchestrator:
                     prior_messages=prior_messages, principal=principal, config=config
                 )
 
-            if not chunks and not config.enabled_tools:
+            if not chunks and not tool_names:
                 # No relevant/authorized document content AND no tools that
                 # could possibly help instead — this is the ONLY remaining
                 # case that hits the hard safe-refusal gate. When
@@ -946,7 +1007,7 @@ class ChatOrchestrator:
 
         system_prompt = config.system_prompt
         tool_result_fallback: str | None = None
-        if not chunks and config.enabled_tools:
+        if not chunks and tool_names:
             # Tools are this turn's only possible route to a real answer.
             # The guidance steers the model; _require_tool_result enforces it.
             system_prompt = f"{system_prompt}\n\n{NO_DOCUMENT_CONTEXT_TOOL_GUIDANCE}"
@@ -956,6 +1017,8 @@ class ChatOrchestrator:
                 tool_result_fallback = CHART_WITHOUT_CONTEXT_REPLY
         if chart_requested:
             system_prompt = f"{system_prompt}\n\n{CHART_TURN_GUIDANCE}"
+        if connector_tools:
+            system_prompt = f"{system_prompt}\n\n{CONNECTOR_TOOL_GUIDANCE}"
 
         prompt = GroundedPrompt(
             system_prompt=system_prompt,
@@ -963,7 +1026,7 @@ class ChatOrchestrator:
             retrieved_chunks=tuple(chunks),
             prior_turns=prior_turns,
             chart_requested=chart_requested,
-            enabled_tools=tuple(config.enabled_tools),
+            enabled_tools=tool_names,
             max_tool_calls=config.max_tool_calls,
         )
         return _PreparedTurn(
@@ -1001,7 +1064,24 @@ class ChatOrchestrator:
             "replaced a reply with no document context and no successful tool call",
             extra={"event": "ungrounded_reply_replaced"},
         )
+        turn = current_turn()
+        unreachable = turn.unreachable_sources() if turn is not None else ()
+        if unreachable:
+            return CONNECTOR_UNREACHABLE_REPLY.format(sources=_join_names(unreachable))
         return setup.tool_result_fallback
+
+    def _connector_provenance(self, text: str) -> tuple[str, tuple[LiveSource, ...]]:
+        """For a reply that stands: the live sources behind it, and the reply
+        with a fixed notice appended if a connector failed this turn and
+        never succeeded, so the answer always says so."""
+        turn = current_turn()
+        if turn is None:
+            return text, ()
+        unreachable = turn.unreachable_sources()
+        if unreachable:
+            notice = CONNECTOR_UNREACHABLE_NOTICE.format(sources=_join_names(unreachable))
+            text = f"{text}\n\n{notice}"
+        return text, turn.live_sources()
 
     async def _reuse_previous_answer_context(
         self,

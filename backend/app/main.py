@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Annotated
 
@@ -20,6 +20,7 @@ from app.api.chat import (
     Citation,
     CreateSessionRequest,
     CreateSessionResponse,
+    LiveSourceOut,
     MessageOut,
 )
 from app.api.ingest import (
@@ -33,6 +34,7 @@ from app.auth.dependencies import require_permission
 from app.auth.provider import JwtAuthProvider
 from app.config.loader import load_all_assistant_configs
 from app.config.settings import Settings
+from app.connectors.runtime import LiveSource
 from app.core.principal import PrincipalContext
 from app.ingestion.pipeline import ParseError
 from app.observability.context import new_request_id, request_id_var
@@ -212,7 +214,20 @@ async def chat(
         ],
         grounded=result.grounded,
         chart=_to_chart_out(result.chart),
+        live_sources=_to_live_sources_out(result.live_sources),
     )
+
+
+def _to_live_sources_out(sources: Sequence[LiveSource]) -> list[LiveSourceOut]:
+    return [
+        LiveSourceOut(
+            connector=s.connector,
+            display_name=s.display_name,
+            operations=list(s.operations),
+            fetched_at=s.fetched_at,
+        )
+        for s in sources
+    ]
 
 
 def _to_chart_out(chart: ChartSpec | None) -> ChartOut | None:
@@ -249,6 +264,9 @@ def _encode_sse_event(event: ChatStreamEvent) -> str:
                 for c in event.citations
             ],
             "grounded": event.grounded,
+            "live_sources": [
+                s.model_dump(mode="json") for s in _to_live_sources_out(event.live_sources)
+            ],
         }
     elif isinstance(event, ChatStreamError):
         payload = {"type": "error", "detail": event.detail}

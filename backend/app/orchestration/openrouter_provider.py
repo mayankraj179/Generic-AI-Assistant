@@ -26,7 +26,7 @@ from app.orchestration.model_provider import (
     ModelReply,
     ModelStreamEvent,
 )
-from app.tools.builtin import TOOL_REGISTRY, ToolExecutionError, execute_tool
+from app.tools.builtin import ToolExecutionError, execute_tool, tool_definition
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ def _build_tools_payload(enabled_tools: tuple[str, ...]) -> list[dict[str, Any]]
     """
     tools = []
     for name in enabled_tools:
-        definition = TOOL_REGISTRY.get(name)
+        definition = tool_definition(name)
         if definition is None:
             continue
         tools.append(

@@ -408,6 +408,93 @@ actions, while it answers. That feature would need its own design:
   the prompt or this framework's config.
 - **Auditing.** Every call is audited, as `turn_audit` does for chat turns.
 
+## Connectors
+
+A connector lets an assistant fetch live data from an external system at question time
+(for example the asking employee's current leave balance), alongside its ingested
+documents. Connectors are **read-only**: an operation can only be a GET, and there is no
+create, update or delete path, so there is no confirmation gate.
+
+**Shape.** A connector *type* (`backend/app/connectors/catalog.py`) declares its operations:
+input schema, timeout, response-size cap, baseline required labels, which fields are
+server-supplied identity, and which response fields reach the model. An assistant enables
+operations with a `connectors:` block. Each enabled operation becomes an ordinary tool
+(`<connector>__<operation>`) on the existing tool path, for every provider, and counts
+toward `max_tool_calls`. Example, from `backend/configs/hr_live_assistant.yaml`:
+
+```yaml
+connectors:
+  - name: hr_system
+    type: hr_api                  # must be a known type; unknown -> config load fails
+    display_name: HR system       # shown as "Source: HR system, live"
+    base_url: http://127.0.0.1:8099
+    auth:
+      method: oauth_client_credentials    # or: api_key (header + key)
+      token_url: http://127.0.0.1:8099/oauth/token
+      client_id: ${HR_API_CLIENT_ID}       # env var references only
+      client_secret: ${HR_API_CLIENT_SECRET}
+    identity:
+      claim: preferred_username   # validated JWT claim = the user's id in that system
+    operations:
+      - name: get_leave_balance   # must be declared by the type; unknown -> load fails
+        required_labels: ["role:authenticated", "scope:development"]
+        timeout_seconds: 3        # may only tighten the type's default
+```
+
+**Rules enforced in code:**
+- **Secrets.** Credential fields accept only `${ENV_VAR}`. A literal value, an unknown key
+  or credentials in a URL fail config loading, and the rejected value is never echoed in
+  the error.
+- **Identity.** The user's id comes from the configured claim on the validated Principal
+  and is injected server-side. Identity parameters are removed from the schema the model
+  sees. If the model sends one anyway it is ignored, and the audit row records a
+  `connector_identity_argument_ignored` guardrail action (field names only). A missing
+  claim means no call.
+- **Authorization.** An operation is offered and callable only if the caller holds **all**
+  of its required labels; there is no empty "everyone" default. A denied call makes no
+  request.
+- **Failures.** Timeouts, unreachable hosts, 4xx/5xx, unreadable or oversized responses
+  become a structured error for the model ("couldn't be reached, don't guess"). On a turn
+  with no document context, a reply not backed by a successful tool result is replaced
+  with a fixed "I couldn't reach the live data source (HR system)" reply. A reply with
+  document context gets a fixed notice appended.
+- **Provenance.** Connector answers are not citations. `/chat` returns `live_sources`
+  (connector, display name, operations, `fetched_at`); `/chat/stream` returns them on
+  the `done` event. The UI shows "Source: HR system, live (10:42)". `grounded` keeps
+  meaning "backed by retrieved documents" only.
+- **Observability.** `turn_audit.tool_calls` records connector, operation, outcome and
+  latency for each call, never arguments, values or tokens. Each call has a
+  `connector.call` span with the same fields. Log output is redacted: known secrets and
+  issued tokens, bearer/basic headers, JWTs and `client_secret=`-style pairs.
+
+**Service credential.** The backend authenticates as itself with an API key, or with
+OAuth client credentials (token cached until shortly before expiry, refreshed, retried
+once after a 401). On-behalf-of / token exchange is not built. The extension point is
+`ConnectorAuth` in `backend/app/connectors/auth.py`, which already receives the Principal.
+It would also need the inbound access token, which `PrincipalContext` doesn't carry today.
+The `on_behalf_of` method name is reserved and rejected with a clear error.
+
+**Local demo** (mock HR system plus `hr_live_assistant`):
+
+```bash
+cd backend
+python scripts/mock_hr_api.py      # http://127.0.0.1:8099; reads HR_API_CLIENT_ID/SECRET from .env
+# then, as an admin, ingest the leave policy document:
+# POST /admin/ingest/sync {"assistant_id": "hr_live_assistant", "tenant_id": "local-development"}
+```
+
+The mock knows `dev_user` and `dev_user_b` (by `preferred_username`).
+`POST /__mock/faults {"delay_seconds": 10}` or `{"status": 503}` simulates failures, and
+`GET /__mock/requests` lists which employee ids were requested.
+
+**Caveats.**
+- Every authenticated dev user gets the same default labels, so the demo's
+  `required_labels` don't separate users. Use a real role, such as `role:employee`, in
+  production.
+- On Gemini, google-adk records tool arguments and results on its own spans by default.
+  Set `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false` to keep live data out of traces.
+- `live_sources` isn't persisted, so a reloaded conversation shows document sources only.
+
 ## Database
 
 ```

@@ -44,15 +44,16 @@ def test_load_all_configs_from_directory():
 
 
 def test_active_assistants_and_their_providers():
-    # Only Azure assistants are active: HR, finance, and the knowledge-sources
-    # example. configs/examples/ is not scanned (non-recursive glob), so the
-    # parked Grok, duplicate Azure and OpenRouter configs must not be loaded
-    # as live assistants.
+    # Only Azure assistants are active: HR, finance, the knowledge-sources
+    # example and the live-connector example. configs/examples/ is not scanned
+    # (non-recursive glob), so the parked Grok, duplicate Azure and OpenRouter
+    # configs must not be loaded as live assistants.
     configs = load_all_assistant_configs(CONFIGS_DIR)
     assert {aid: c.model.provider for aid, c in configs.items()} == {
         "hr_assistant": "azure_ai",
         "finance_assistant": "azure_ai",
         "kb_demo_assistant": "azure_ai",
+        "hr_live_assistant": "azure_ai",
     }
 
 
