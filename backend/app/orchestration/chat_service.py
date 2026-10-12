@@ -13,6 +13,7 @@ from opentelemetry import trace
 
 from app.config.assistant_config import AssistantConfig
 from app.config.settings import Settings
+from app.connectors.http import Resolver
 from app.connectors.runtime import LiveSource, TurnConnectors, bind_turn, current_turn
 from app.core.principal import PrincipalContext
 from app.guardrails import input as input_guardrails
@@ -385,10 +386,13 @@ class ChatOrchestrator:
         embedding_provider_factory: EmbeddingProviderFactory | None = None,
         audit_store: AuditStore | None = None,
         connector_transport: httpx.AsyncBaseTransport | None = None,
+        connector_resolver: Resolver | None = None,
     ) -> None:
         self._retrieval_service = retrieval_service
-        # Tests inject an httpx.MockTransport; None means real HTTP.
+        # Tests inject an httpx.MockTransport and a fake DNS resolver; None
+        # means real HTTP and real DNS.
         self._connector_transport = connector_transport
+        self._connector_resolver = connector_resolver
         self._provider_factory = provider_factory
         self._conversation_store = conversation_store or ConversationStore()
         # None disables the per-turn audit row (unit tests stay DB-free);
@@ -432,7 +436,12 @@ class ChatOrchestrator:
         # Every turn binds its own connectors, bound to this principal, even
         # when the config has none: nothing from an earlier turn can leak in.
         bind_turn(
-            TurnConnectors(principal, config.connectors, transport=self._connector_transport)
+            TurnConnectors(
+                principal,
+                config.connectors,
+                transport=self._connector_transport,
+                resolver=self._connector_resolver,
+            )
         )
         return recorder
 

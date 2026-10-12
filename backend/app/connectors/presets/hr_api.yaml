@@ -1,0 +1,24 @@
+# The mock HR system's API (scripts/mock_hr_api.py). Not a real vendor: it
+# exists to exercise the connector framework end to end in development.
+type: hr_api
+description: Read-only HR system REST API (leave balances), as served by scripts/mock_hr_api.py.
+auth_methods: [oauth_client_credentials, api_key, bearer, basic]
+operations:
+  - name: get_leave_balance
+    description: >-
+      Gets the signed-in employee's current leave balance (days available, used
+      and accrued, per leave type) live from the HR system. It always returns
+      the balance of the user who is asking and cannot look up any other
+      employee.
+    method: GET
+    path: /api/v1/employees/{employee_id}/leave-balance
+    parameters:
+      employee_id: {in: path, identity: true, description: HR employee id.}
+      leave_type:
+        in: query
+        enum: [annual, sick, casual]
+        description: Optional, one leave type. Omit to get every type.
+    response:
+      fields: [as_of, balances]
+    timeout_seconds: 5
+    max_response_bytes: 16000

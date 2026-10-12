@@ -131,10 +131,10 @@ def _connector(**overrides) -> dict:
         "name": "hr_system",
         "type": "hr_api",
         "display_name": "HR system",
-        "base_url": "http://hr.test",
+        "base_url": "https://hr.test",
         "auth": {
             "method": "oauth_client_credentials",
-            "token_url": "http://hr.test/oauth/token",
+            "token_url": "https://hr.test/oauth/token",
             "client_id": "${HR_TEST_CLIENT_ID}",
             "client_secret": "${HR_TEST_CLIENT_SECRET}",
         },
@@ -156,9 +156,20 @@ def _principal(username: str | None = "user_a", labels=LABELS) -> PrincipalConte
     )
 
 
+async def public_dns(host: str, port: int) -> list[str]:
+    """Every test host resolves to a public address (documentation range
+    lookalike outside the reserved blocks), so the SSRF check passes."""
+    return ["93.184.216.34"]
+
+
 def _turn(principal=None, hr: MockHR | None = None, **connector) -> TurnConnectors:
     config = ConnectorConfig.model_validate(_connector(**connector))
-    return TurnConnectors(principal or _principal(), [config], transport=(hr or MockHR()).transport)
+    return TurnConnectors(
+        principal or _principal(),
+        [config],
+        transport=(hr or MockHR()).transport,
+        resolver=public_dns,
+    )
 
 
 def _recorder() -> TurnRecorder:
@@ -184,7 +195,7 @@ def _recorder() -> TurnRecorder:
     [
         {
             "method": "oauth_client_credentials",
-            "token_url": "http://hr.test/oauth/token",
+            "token_url": "https://hr.test/oauth/token",
             "client_id": "${HR_TEST_CLIENT_ID}",
             "client_secret": "literal-secret-value-123",
         },
@@ -415,7 +426,11 @@ async def test_unreachable_host_is_unavailable():
         raise httpx.ConnectError("connection refused", request=request)
 
     config = ConnectorConfig.model_validate(_connector())
-    bind_turn(TurnConnectors(_principal(), [config], transport=httpx.MockTransport(refuse)))
+    bind_turn(
+        TurnConnectors(
+            _principal(), [config], transport=httpx.MockTransport(refuse), resolver=public_dns
+        )
+    )
     assert (await execute_tool(TOOL, {}))["error_kind"] == "unavailable"
 
 
@@ -424,7 +439,7 @@ async def test_missing_secret_env_var_is_not_configured():
     hr = MockHR()
     auth = {
         "method": "oauth_client_credentials",
-        "token_url": "http://hr.test/oauth/token",
+        "token_url": "https://hr.test/oauth/token",
         "client_id": "${HR_TEST_CLIENT_ID}",
         "client_secret": "${HR_TEST_SECRET_THAT_IS_NOT_SET}",
     }
@@ -699,6 +714,7 @@ def _orchestrator(hr: MockHR, chunks=()) -> tuple[ChatOrchestrator, _Adversarial
         conversation_store=_FakeStore(),
         audit_store=_Audit(),
         connector_transport=hr.transport,
+        connector_resolver=public_dns,
     )
     return orchestrator, model, rows
 
@@ -851,5 +867,5 @@ async def test_each_call_gets_a_span_without_values_or_identity():
         dumped = json.dumps(dict(span.attributes))
         for value in ("14.5", "user_a", "user_b", "issued-token", CLIENT_SECRET):
             assert value not in dumped
-    assert spans[0].attributes["http.status_code"] == 200
+    assert spans[0].attributes["connector.pages"] == 1
     assert spans[1].status.status_code.name == "ERROR"

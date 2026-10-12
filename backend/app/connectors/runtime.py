@@ -12,9 +12,12 @@ Order of checks in execute(), each failing closed:
   2. the caller holds every required label (no request is made otherwise);
   3. identity arguments the model sent are dropped (and noted), the rest are
      validated against the schema the model was shown;
-  4. the identity value comes from the configured claim on the Principal,
-     and is missing means no call;
-  5. one GET, bounded by the operation's timeout and response-size cap.
+  4. identity values come from the configured claims on the Principal; a
+     missing claim means no call;
+  5. the request is built from the operation's template only (the model
+     supplies values, never a URL, host, path or header) and sent under the
+     network rules in http.py, page by page, within the operation's timeout,
+     payload cap, max_pages and max_items.
 A failure becomes a structured error result for the model, never an
 exception that ends the turn.
 """
@@ -24,23 +27,32 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import weakref
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import httpx
 from jsonschema import Draft202012Validator
 
 from app.config.connectors import ConnectorConfig
-from app.connectors.auth import ConnectorCallError, auth_for
-from app.connectors.base import ConnectorOperation, tool_name
-from app.connectors.catalog import CONNECTOR_TYPES
+from app.connectors.auth import AuthContext, ConnectorCallError, auth_for
+from app.connectors.http import (
+    NetworkGuard,
+    Request,
+    Resolver,
+    Response,
+    send,
+    system_resolver,
+    within_base,
+)
+from app.connectors.spec import OperationSpec, tool_name
 from app.core.principal import PrincipalContext
 from app.core.tool_definition import ToolDefinition, ToolKind
 from app.observability.audit import record_connector_call, record_guardrail
@@ -54,11 +66,16 @@ _DO_NOT_GUESS = "Do not estimate or guess the value."
 _FAILURE_MESSAGES = {
     "timeout": "{source} did not respond in time, so the live data could not be retrieved.",
     "unavailable": "{source} could not be reached, so the live data could not be retrieved.",
+    "rate_limited": "{source} is limiting requests right now, so the live data could not be "
+    "retrieved.",
     "auth_failed": "{source} could not be reached (the service connection was rejected).",
     "not_configured": "{source} is not configured on this server, so it could not be reached.",
+    "blocked_address": "{source} is not reachable from this server (address not allowed).",
+    "redirect_refused": "{source} pointed the request outside the configured system, so it was "
+    "stopped.",
     "bad_response": "{source} returned a response that could not be read.",
     "response_too_large": "{source} returned more data than allowed, so it was discarded.",
-    "not_found": "{source} has no record for the signed-in user.",
+    "not_found": "{source} has no matching record for the signed-in user.",
     "denied": "The signed-in user is not permitted to use this {source} lookup.",
     "identity_unavailable": (
         "The signed-in user's {source} id is not available, so their data cannot be looked up."
@@ -72,12 +89,17 @@ UNREACHABLE_KINDS = frozenset(
     {
         "timeout",
         "unavailable",
+        "rate_limited",
         "auth_failed",
         "not_configured",
+        "blocked_address",
+        "redirect_refused",
         "bad_response",
         "response_too_large",
     }
 )
+_LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;[^,]*\brel="?next"?', re.IGNORECASE)
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -102,43 +124,62 @@ class ConnectorOutcome:
 @dataclass(frozen=True)
 class _BoundOperation:
     connector: ConnectorConfig
-    operation: ConnectorOperation
-    required_labels: frozenset[str]
-    timeout_seconds: float
-    max_response_bytes: int
+    spec: OperationSpec
     definition: ToolDefinition
 
 
 def _bind_operations(connectors: Sequence[ConnectorConfig]) -> dict[str, _BoundOperation]:
     bound: dict[str, _BoundOperation] = {}
     for connector in connectors:
-        connector_type = CONNECTOR_TYPES[connector.type]
-        for op_config in connector.operations:
-            operation = connector_type.operations[op_config.name]
-            name = tool_name(connector.name, operation.name)
-            labels = operation.required_labels | op_config.required_labels
-            # Config can tighten the operation's limits, never loosen them.
-            timeout = operation.timeout_seconds
-            if op_config.timeout_seconds is not None:
-                timeout = min(timeout, op_config.timeout_seconds)
-            max_bytes = operation.max_response_bytes
-            if op_config.max_response_bytes is not None:
-                max_bytes = min(max_bytes, op_config.max_response_bytes)
+        for spec in connector.resolved_operations():
+            name = tool_name(connector.name, spec.name)
             bound[name] = _BoundOperation(
                 connector=connector,
-                operation=operation,
-                required_labels=labels,
-                timeout_seconds=timeout,
-                max_response_bytes=max_bytes,
+                spec=spec,
                 definition=ToolDefinition(
                     name=name,
-                    description=f"[{connector.display_name}, live] {operation.description}",
+                    description=f"[{connector.display_name}, live] {spec.description}",
                     kind=ToolKind.QUERY,
-                    input_schema=operation.model_input_schema(),
-                    requires_labels=labels,
+                    input_schema=spec.model_input_schema(),
+                    requires_labels=spec.required_labels,
                 ),
             )
     return bound
+
+
+# --- response helpers ---------------------------------------------------------
+
+
+def get_path(value: Any, path: str) -> Any:
+    """Dotted-path lookup that also handles keys containing dots
+    ("@odata.nextLink") and list indexes. Returns _MISSING if absent."""
+    if isinstance(value, dict) and path in value:
+        return value[path]
+    parts = path.split(".")
+    for i in range(1, len(parts)):
+        head, rest = ".".join(parts[:i]), ".".join(parts[i:])
+        if isinstance(value, dict) and head in value:
+            found = get_path(value[head], rest)
+            if found is not _MISSING:
+                return found
+        elif isinstance(value, list) and head.isdigit() and int(head) < len(value):
+            found = get_path(value[int(head)], rest)
+            if found is not _MISSING:
+                return found
+    if isinstance(value, list) and path.isdigit() and int(path) < len(value):
+        return value[int(path)]
+    return _MISSING
+
+
+def _project(record: Any, fields: Sequence[str]) -> Any:
+    if not fields or not isinstance(record, dict):
+        return record
+    out = {}
+    for field in fields:
+        found = get_path(record, field)
+        if found is not _MISSING:
+            out[field] = found
+    return out
 
 
 def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
@@ -157,6 +198,25 @@ def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
     return {prefix.rstrip("."): value}
 
 
+def _parse_json(response: Response) -> Any:
+    try:
+        payload = json.loads(response.body)
+    except ValueError as exc:
+        raise ConnectorCallError("bad_response", "not JSON") from exc
+    if not isinstance(payload, dict | list):
+        raise ConnectorCallError("bad_response", "not a JSON object or array")
+    return payload
+
+
+def _query_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+# --- per-turn execution -------------------------------------------------------
+
+
 class TurnConnectors:
     """The connector operations available in one turn, bound to its caller."""
 
@@ -166,10 +226,13 @@ class TurnConnectors:
         connectors: Sequence[ConnectorConfig],
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        resolver: Resolver | None = None,
     ) -> None:
         self._principal = principal
         self._operations = _bind_operations(connectors)
         self._transport = transport
+        self._resolver = resolver or system_resolver
+        self._guards: dict[str, NetworkGuard] = {}
         self.outcomes: list[ConnectorOutcome] = []
 
     # --- what the model is offered ------------------------------------------
@@ -177,7 +240,8 @@ class TurnConnectors:
     def _authorized(self, bound: _BoundOperation) -> bool:
         # Fail closed: an operation with no required labels is callable by
         # no one (config validation already requires at least one).
-        return bool(bound.required_labels) and bound.required_labels <= self._principal.labels
+        labels = bound.spec.required_labels
+        return bool(labels) and labels <= self._principal.labels
 
     def is_connector_tool(self, name: str) -> bool:
         return name in self._operations
@@ -226,20 +290,21 @@ class TurnConnectors:
         if bound is None:
             return {"error": _FAILURE_MESSAGES["unknown_tool"], "error_kind": "unknown_tool"}
 
-        connector, operation = bound.connector, bound.operation
+        connector, spec = bound.connector, bound.spec
         started = time.perf_counter()
         with start_span(
             "connector.call",
             connector=connector.name,
             connector_type=connector.type,
-            operation=operation.name,
+            operation=spec.name,
+            method=spec.method,
         ) as span:
             fetched_at: datetime | None = None
-            status: int | None = None
             data: Any = None
+            pages = 0
             failure: ConnectorCallError | None = None
             try:
-                data, status = await self._call(bound, arguments)
+                data, pages = await self._call(bound, arguments)
                 fetched_at = datetime.now(UTC)
                 outcome = "ok"
             except ConnectorCallError as exc:
@@ -248,30 +313,30 @@ class TurnConnectors:
 
             span.set_attribute("connector.outcome", outcome)
             span.set_attribute("connector.latency_ms", latency_ms)
-            if status is not None:
-                span.set_attribute("http.status_code", status)
-            if outcome != "ok":
+            span.set_attribute("connector.pages", pages)
+            if failure is not None:
                 mark_error(span, outcome, outcome)
 
         self.outcomes.append(
             ConnectorOutcome(
                 connector=connector.name,
                 display_name=connector.display_name,
-                operation=operation.name,
+                operation=spec.name,
                 outcome=outcome,
                 fetched_at=fetched_at,
             )
         )
         logger.info(
-            "connector %s.%s outcome=%s latency_ms=%d",
+            "connector %s.%s outcome=%s latency_ms=%d pages=%d",
             connector.name,
-            operation.name,
+            spec.name,
             outcome,
             latency_ms,
+            pages,
             extra={
                 "event": "connector_call",
                 "connector": connector.name,
-                "operation": operation.name,
+                "operation": spec.name,
                 "outcome": outcome,
                 "latency_ms": latency_ms,
             },
@@ -281,27 +346,26 @@ class TurnConnectors:
             record_connector_call(
                 name,
                 connector=connector.name,
-                operation=operation.name,
+                operation=spec.name,
                 outcome=outcome,
                 latency_ms=latency_ms,
             )
             return self._error_result(bound, failure)
 
         assert fetched_at is not None
-        result = {
-            "source": f"{connector.display_name} (live)",
-            "fetched_at": fetched_at.isoformat(timespec="seconds"),
-            "data": data,
-        }
         record_connector_call(
             name,
             connector=connector.name,
-            operation=operation.name,
+            operation=spec.name,
             outcome="ok",
             latency_ms=latency_ms,
             values=_flatten(data),
         )
-        return result
+        return {
+            "source": f"{connector.display_name} (live)",
+            "fetched_at": fetched_at.isoformat(timespec="seconds"),
+            "data": data,
+        }
 
     def _error_result(self, bound: _BoundOperation, failure: ConnectorCallError) -> dict[str, Any]:
         template = _FAILURE_MESSAGES.get(failure.kind, "{source} returned an error.")
@@ -315,49 +379,176 @@ class TurnConnectors:
         }
 
     async def _call(self, bound: _BoundOperation, arguments: dict[str, Any]) -> tuple[Any, int]:
-        connector, operation = bound.connector, bound.operation
+        connector, spec = bound.connector, bound.spec
 
         if not self._authorized(bound):
             raise ConnectorCallError("denied", "missing required labels")
 
-        supplied_identity = sorted(set(arguments) & operation.identity_params)
+        identity_params = spec.identity_params()
+        supplied_identity = sorted(set(arguments) & identity_params.keys())
         if supplied_identity:
             # Names only, never values: the model tried to choose whose data
             # to read. It is ignored; the server-side identity is used.
             record_guardrail(
                 "connector_identity_argument_ignored",
                 connector=connector.name,
-                operation=operation.name,
+                operation=spec.name,
                 fields=supplied_identity,
             )
-        model_args = {k: v for k, v in arguments.items() if k not in operation.identity_params}
+        values = {k: v for k, v in arguments.items() if k not in identity_params}
         errors = sorted(
-            Draft202012Validator(operation.model_input_schema()).iter_errors(model_args),
+            Draft202012Validator(spec.model_input_schema()).iter_errors(values),
             key=lambda e: list(e.path),
         )
         if errors:
             raise ConnectorCallError("invalid_arguments", errors[0].message[:200])
 
-        identity_value: str | None = None
-        if operation.identity_params:
-            assert connector.identity is not None  # enforced by config validation
-            identity_value = self._principal.claims.get(connector.identity.claim) or None
-            if identity_value is None:
+        for pname, param in identity_params.items():
+            claim = param.claim or (connector.identity.claim if connector.identity else None)
+            value = self._principal.claims.get(claim) if claim else None
+            if not value:
                 raise ConnectorCallError("identity_unavailable", "identity claim missing")
+            values[pname] = value
 
-        values: dict[str, Any] = dict(model_args)
-        for param in operation.identity_params:
-            values[param] = identity_value
-        path = operation.path.format(
-            **{k: quote(str(v), safe="") for k, v in values.items() if f"{{{k}}}" in operation.path}
-        )
-        query = {k: str(values[k]) for k in operation.query_params if values.get(k) is not None}
-
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + spec.timeout_seconds
         try:
-            async with asyncio.timeout(bound.timeout_seconds):
-                return await self._get(bound, f"{connector.base_url}{path}", query)
+            async with asyncio.timeout(spec.timeout_seconds):
+                return await self._fetch(bound, values, deadline)
         except TimeoutError as exc:
             raise ConnectorCallError("timeout", "timed out") from exc
+
+    def _first_request(self, bound: _BoundOperation, values: dict[str, Any]) -> Request:
+        connector, spec = bound.connector, bound.spec
+        path = spec.path
+        query: dict[str, str] = {k: _query_value(v) for k, v in spec.fixed_query.items()}
+        body: dict[str, Any] = dict(spec.fixed_body)
+        for pname, param in spec.parameters.items():
+            if pname not in values:
+                continue
+            value = values[pname]
+            if param.location == "path":
+                path = path.replace("{" + pname + "}", quote(str(value), safe=""))
+            elif param.location == "query":
+                query[pname] = _query_value(value)
+            else:
+                body[pname] = value
+        pagination = spec.pagination
+        if pagination.page_size_param:
+            target = body if spec.method == "POST" else query
+            target[pagination.page_size_param] = (
+                pagination.page_size if spec.method == "POST" else str(pagination.page_size)
+            )
+        return Request(
+            method=spec.method,
+            url=f"{connector.base_url}{path}",
+            params=query or None,
+            json=body if spec.method == "POST" else None,
+            headers=dict(spec.headers),
+        )
+
+    def _next_request(
+        self,
+        bound: _BoundOperation,
+        current: Request,
+        response: Response,
+        payload: Any,
+        records: list[Any],
+        offset: int,
+    ) -> Request | None:
+        spec, pagination = bound.spec, bound.spec.pagination
+        strategy = pagination.strategy
+
+        if strategy in ("offset", "cursor"):
+            if strategy == "offset":
+                if not records or (pagination.page_size and len(records) < pagination.page_size):
+                    return None
+                key, value = pagination.offset_param, offset
+            else:
+                cursor = get_path(payload, pagination.cursor_path or "")
+                if cursor is _MISSING or cursor in (None, ""):
+                    return None
+                key, value = pagination.cursor_param, cursor
+            if spec.method == "POST":
+                return replace(current, json={**(current.json or {}), key: value})
+            return replace(current, params={**(current.params or {}), key: _query_value(value)})
+
+        if strategy == "link_header":
+            match = _LINK_NEXT_RE.search(response.headers.get("link", ""))
+            link = match.group(1) if match else None
+        else:  # odata_next_link
+            found = get_path(payload, pagination.next_link_path)
+            link = found if isinstance(found, str) and found else None
+        if link is None:
+            return None
+        target = urljoin(response.url, link)
+        if not within_base(bound.connector.base_url, target):
+            # A link pointing anywhere else is never followed.
+            raise ConnectorCallError("redirect_refused", "next-page link outside base_url")
+        return replace(current, url=target, params=None)
+
+    async def _fetch(
+        self, bound: _BoundOperation, values: dict[str, Any], deadline: float
+    ) -> tuple[Any, int]:
+        connector, spec = bound.connector, bound.spec
+        guard = self._guards.setdefault(
+            connector.name,
+            NetworkGuard(
+                allow_private_network=connector.allow_private_network, resolver=self._resolver
+            ),
+        )
+        auth = auth_for(connector)
+        root, fields = spec.response.root, spec.response.fields
+        max_items = spec.response.max_items
+        request: Request | None = self._first_request(bound, values)
+
+        async with self._client() as client:
+            auth_context = AuthContext(client=client, principal=self._principal, guard=guard.check)
+            items: list[Any] = []
+            pages = offset = 0
+            truncated = False
+            while request is not None:
+                response = await send(
+                    request,
+                    client=client,
+                    base_url=connector.base_url,
+                    guard=guard,
+                    auth=auth,
+                    auth_context=auth_context,
+                    timeout=spec.timeout_seconds,
+                    max_bytes=spec.max_response_bytes,
+                    deadline=deadline,
+                )
+                pages += 1
+                payload = _parse_json(response)
+                target = get_path(payload, root) if root else payload
+                if target is _MISSING:
+                    raise ConnectorCallError("bad_response", "response.root not in the response")
+
+                if spec.pagination.strategy == "none":
+                    if isinstance(target, list):
+                        return {
+                            "items": [_project(r, fields) for r in target[:max_items]],
+                            "returned": min(len(target), max_items),
+                            "truncated": len(target) > max_items,
+                        }, pages
+                    return _project(target, fields), pages
+
+                if not isinstance(target, list):
+                    raise ConnectorCallError("bad_response", "response.root is not a list")
+                items.extend(target)
+                offset += len(target)
+                next_request = self._next_request(bound, request, response, payload, target, offset)
+                if len(items) >= max_items or pages >= spec.pagination.max_pages:
+                    truncated = len(items) > max_items or next_request is not None
+                    break
+                request = next_request
+
+        return {
+            "items": [_project(r, fields) for r in items[:max_items]],
+            "returned": min(len(items), max_items),
+            "truncated": truncated,
+        }, pages
 
     @asynccontextmanager
     async def _client(self) -> AsyncIterator[httpx.AsyncClient]:
@@ -367,51 +558,11 @@ class TurnConnectors:
         else:
             yield _shared_client()
 
-    async def _get(
-        self, bound: _BoundOperation, url: str, query: dict[str, str]
-    ) -> tuple[Any, int]:
-        auth = auth_for(bound.connector)
-        async with self._client() as client:
-            for attempt in (1, 2):
-                headers = {"Accept": "application/json"}
-                await auth.apply(headers, client=client, principal=self._principal)
-                try:
-                    async with client.stream(
-                        "GET", url, params=query, headers=headers, timeout=bound.timeout_seconds
-                    ) as response:
-                        status = response.status_code
-                        if status == 401 and attempt == 1:
-                            # A cached token the system no longer accepts:
-                            # drop it and retry once (safe, the call is a GET).
-                            auth.invalidate()
-                            continue
-                        if status in (401, 403):
-                            raise ConnectorCallError("auth_failed", f"http {status}")
-                        if status == 404:
-                            raise ConnectorCallError("not_found", "http 404")
-                        if status != 200:
-                            raise ConnectorCallError("unavailable", f"http {status}")
-                        body = await _read_capped(response, bound.max_response_bytes)
-                except httpx.TimeoutException as exc:
-                    raise ConnectorCallError("timeout", "timed out") from exc
-                except httpx.HTTPError as exc:
-                    raise ConnectorCallError("unavailable", type(exc).__name__) from exc
-                try:
-                    payload = json.loads(body)
-                except ValueError as exc:
-                    raise ConnectorCallError("bad_response", "not JSON") from exc
-                if not isinstance(payload, dict):
-                    raise ConnectorCallError("bad_response", "not a JSON object")
-                fields = bound.operation.result_fields
-                data = {k: payload[k] for k in fields if k in payload} if fields else payload
-                return data, status
-        # Both attempts got 401 (the second one raises above); kept for the type checker.
-        raise ConnectorCallError("auth_failed", "http 401")  # pragma: no cover
-
 
 # One pooled client per event loop for real HTTP: building an AsyncClient
 # loads a TLS context, which measured ~1s on a Windows dev machine, longer
 # than the call itself. Per-request timeouts come from each operation.
+# Redirects are never followed by httpx itself (see http.send).
 _shared_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = (
     weakref.WeakKeyDictionary()
 )
@@ -423,18 +574,6 @@ def _shared_client() -> httpx.AsyncClient:
     if client is None or client.is_closed:
         client = _shared_clients[loop] = httpx.AsyncClient(follow_redirects=False, timeout=30.0)
     return client
-
-
-async def _read_capped(response: httpx.Response, limit: int) -> bytes:
-    declared = response.headers.get("content-length")
-    if declared is not None and declared.isdigit() and int(declared) > limit:
-        raise ConnectorCallError("response_too_large", "content-length over cap")
-    body = bytearray()
-    async for chunk in response.aiter_bytes():
-        body.extend(chunk)
-        if len(body) > limit:
-            raise ConnectorCallError("response_too_large", "body over cap")
-    return bytes(body)
 
 
 # --- per-turn binding ---------------------------------------------------------

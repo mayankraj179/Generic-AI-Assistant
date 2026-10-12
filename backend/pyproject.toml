@@ -42,6 +42,7 @@ packages = [
     "app.api",
     "app.auth",
     "app.config",
+    "app.connectors",
     "app.core",
     "app.db",
     "app.guardrails",
@@ -51,6 +52,9 @@ packages = [
     "app.services",
     "app.tools",
 ]
+
+[tool.setuptools.package-data]
+"app.connectors" = ["presets/*.yaml"]
 
 [project.optional-dependencies]
 dev = [

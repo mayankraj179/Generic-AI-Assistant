@@ -40,6 +40,9 @@ connectors:
     type: hr_api
     display_name: HR system
     base_url: http://127.0.0.1:8099
+    # The dev mock runs on this machine. Without this, plain http and
+    # loopback/private addresses are refused (SSRF rule).
+    allow_private_network: true
     auth:
       method: oauth_client_credentials
       token_url: http://127.0.0.1:8099/oauth/token
