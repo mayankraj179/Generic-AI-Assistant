@@ -1,0 +1,191 @@
+# Microsoft Graph (v1.0), read-only: the signed-in user's profile and
+# manager, their own OneDrive's top-level item metadata, items of one
+# configured SharePoint list, and item metadata in one configured document
+# library.
+#
+# base_url: https://graph.microsoft.com/v1.0
+# auth: oauth_client_credentials against Entra ID:
+#   token_url: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
+#   scope: https://graph.microsoft.com/.default
+#   client_auth: post
+# Paging follows @odata.nextLink (only on graph.microsoft.com/v1.0).
+# Throttling: Retry-After on 429/503 is honoured; a 429 without it backs off.
+#
+# App-only access ignores each user's own SharePoint and OneDrive
+# permissions. Scoping here comes from three places: identity (profile,
+# manager, OneDrive, "my" list items are the caller's own), admin-fixed
+# settings (which site, list, library and folder; never chosen by the model)
+# and required_labels. List and library operations return the same rows to
+# everyone allowed to call them. Use them only for data every such user may
+# see, and prefer the Sites.Selected permission so the app can read only the
+# configured sites.
+#
+# identity: /users/{id} accepts an object id or a userPrincipalName. The
+#   email default works where mail equals the UPN; production should map the
+#   Entra object id (oid) or UPN claim.
+# settings used: site_id, list_id, owner_column (my_list_items), drive_id,
+#   folder_id (library_folder_items, get_library_item).
+type: microsoft_graph
+description: Microsoft Graph (v1.0) and SharePoint, read-only, app-only (Entra ID client credentials).
+auth_methods: [oauth_client_credentials]
+operations:
+  - name: my_profile
+    description: >-
+      Gets the signed-in user's own directory profile: name, job title,
+      department, office location, email and phone numbers.
+    method: GET
+    path: /users/{user}
+    parameters:
+      user: {in: path, identity: true}
+    fixed_query:
+      $select: displayName,jobTitle,department,officeLocation,mail,businessPhones,mobilePhone,employeeId
+    response:
+      fields: [displayName, jobTitle, department, officeLocation, mail, businessPhones,
+               mobilePhone, employeeId]
+    timeout_seconds: 8
+    max_response_bytes: 32000
+
+  - name: my_manager
+    description: >-
+      Gets the signed-in user's manager: name, job title, department, email
+      and office location.
+    method: GET
+    path: /users/{user}/manager
+    parameters:
+      user: {in: path, identity: true}
+    fixed_query:
+      $select: displayName,jobTitle,department,mail,officeLocation
+    response:
+      fields: [displayName, jobTitle, department, mail, officeLocation]
+    timeout_seconds: 8
+    max_response_bytes: 32000
+
+  - name: my_drive_items
+    description: >-
+      Lists the files and folders at the top of the signed-in user's own
+      OneDrive (metadata only: name, link, size, last modified).
+    method: GET
+    path: /users/{user}/drive/root/children
+    parameters:
+      user: {in: path, identity: true}
+    fixed_query:
+      $select: id,name,webUrl,size,lastModifiedDateTime,lastModifiedBy,file,folder
+    response:
+      root: value
+      fields: [id, name, webUrl, size, lastModifiedDateTime,
+               lastModifiedBy.user.displayName, file.mimeType, folder.childCount]
+      max_items: 50
+    pagination:
+      strategy: odata_next_link
+      page_size: 25
+      page_size_param: $top
+      max_pages: 2
+    timeout_seconds: 10
+    max_response_bytes: 500000
+
+  - name: list_items
+    description: >-
+      Lists items of the SharePoint list this assistant is configured for
+      (shared data every permitted user can see), most recently modified
+      first.
+    method: GET
+    path: /sites/{site_id}/lists/{list_id}/items
+    parameters:
+      site_id: {in: path, setting: site_id}
+      list_id: {in: path, setting: list_id}
+    fixed_query:
+      expand: fields
+      $orderby: lastModifiedDateTime desc
+    response:
+      root: value
+      fields: [id, webUrl, lastModifiedDateTime, fields]
+      max_items: 50
+    pagination:
+      strategy: odata_next_link
+      page_size: 25
+      page_size_param: $top
+      max_pages: 2
+    timeout_seconds: 10
+    max_response_bytes: 1000000
+
+  - name: my_list_items
+    description: >-
+      Lists the items in the configured SharePoint list that belong to the
+      signed-in user (the list's owner column holds their email).
+    method: GET
+    path: /sites/{site_id}/lists/{list_id}/items
+    parameters:
+      site_id: {in: path, setting: site_id}
+      list_id: {in: path, setting: list_id}
+      owner_column: {in: template, setting: owner_column, raw: true}
+      user: {in: template, identity: true}
+    templates:
+      $filter:
+        language: odata
+        parts:
+          - "fields/{owner_column} eq {user}"
+    fixed_query:
+      expand: fields
+    # Graph refuses a filter on a non-indexed column unless asked to try;
+    # index the owner column in SharePoint so this stays reliable.
+    headers:
+      Prefer: HonorNonIndexedQueriesWarningMayFailRandomly
+    response:
+      root: value
+      fields: [id, webUrl, lastModifiedDateTime, fields]
+      max_items: 50
+    pagination:
+      strategy: odata_next_link
+      page_size: 25
+      page_size_param: $top
+      max_pages: 2
+    timeout_seconds: 10
+    max_response_bytes: 1000000
+
+  - name: library_folder_items
+    description: >-
+      Lists the files and folders in the configured SharePoint document
+      library folder (metadata only: name, link, size, last modified and by
+      whom). Not file contents.
+    method: GET
+    path: /drives/{drive_id}/items/{folder_id}/children
+    parameters:
+      drive_id: {in: path, setting: drive_id}
+      folder_id: {in: path, setting: folder_id}
+    fixed_query:
+      $select: id,name,webUrl,size,lastModifiedDateTime,lastModifiedBy,file,folder
+    response:
+      root: value
+      fields: [id, name, webUrl, size, lastModifiedDateTime,
+               lastModifiedBy.user.displayName, file.mimeType, folder.childCount]
+      max_items: 50
+    pagination:
+      strategy: odata_next_link
+      page_size: 25
+      page_size_param: $top
+      max_pages: 2
+    timeout_seconds: 10
+    max_response_bytes: 500000
+
+  - name: get_library_item
+    description: >-
+      Gets the metadata (name, link, size, last modified and by whom) of one
+      item in the configured SharePoint document library, by its item id
+      from library_folder_items. Not file contents.
+    method: GET
+    path: /drives/{drive_id}/items/{item_id}
+    parameters:
+      drive_id: {in: path, setting: drive_id}
+      item_id:
+        in: path
+        pattern: "^[A-Za-z0-9!_-]{10,100}$"
+        description: The item id, as returned by library_folder_items.
+    required: [item_id]
+    fixed_query:
+      $select: id,name,webUrl,size,createdDateTime,lastModifiedDateTime,lastModifiedBy,file,folder,parentReference
+    response:
+      fields: [id, name, webUrl, size, createdDateTime, lastModifiedDateTime,
+               lastModifiedBy.user.displayName, file.mimeType, folder.childCount,
+               parentReference.path]
+    timeout_seconds: 8
+    max_response_bytes: 64000

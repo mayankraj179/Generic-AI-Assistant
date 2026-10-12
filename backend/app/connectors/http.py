@@ -11,7 +11,8 @@
   egress filtering at the network layer is the backstop for that.
 - Redirects: followed only for GET, only within base_url, at most 3 hops.
 - Throttling: a 429 or 503 with Retry-After is retried (at most twice) when
-  the wait fits in the operation's remaining time; otherwise rate_limited.
+  the wait fits in the operation's remaining time; a 429 without it backs off
+  1s then 2s on the same terms; otherwise rate_limited.
 - 401: the cached credential is dropped and the request retried once.
 - Size: the body is read up to the operation's payload cap, then refused.
 """
@@ -38,6 +39,7 @@ Resolver = Callable[[str, int], Awaitable[list[str]]]
 MAX_REDIRECTS = 3
 MAX_THROTTLE_RETRIES = 2
 MAX_RETRY_AFTER_SECONDS = 10.0
+BACKOFF_BASE_SECONDS = 1.0
 
 
 async def system_resolver(host: str, port: int) -> list[str]:
@@ -175,6 +177,10 @@ async def send(
                     continue
                 if status in (429, 503):
                     delay = retry_after_seconds(response.headers.get("retry-after"))
+                    if delay is None and status == 429:
+                        # No Retry-After (Graph omits it sometimes): exponential
+                        # backoff, as Microsoft's throttling guidance asks.
+                        delay = BACKOFF_BASE_SECONDS * (2**throttle_retries)
                     fits = (
                         delay is not None
                         and delay <= MAX_RETRY_AFTER_SECONDS

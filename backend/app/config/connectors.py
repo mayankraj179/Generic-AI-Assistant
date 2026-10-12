@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.config.knowledge_sources import EnvRef, _no_url_credentials
 from app.connectors.catalog import CONNECTOR_PRESETS, REST_TYPE
 from app.connectors.spec import (
+    IDENTIFIER_RE,
     MAX_TOOL_NAME_LENGTH,
     OperationSpec,
     check_labels,
@@ -39,6 +40,7 @@ from app.connectors.spec import (
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+$")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 AUTH_METHODS = ("api_key", "basic", "bearer", "oauth_client_credentials", "oauth_jwt_bearer")
 # Named so a config asking for them gets a clear error rather than "unknown".
@@ -229,6 +231,9 @@ class ConnectorConfig(_Strict):
     allow_private_network: bool = False
     auth: ConnectorAuthConfig
     identity: ConnectorIdentityConfig = Field(default_factory=ConnectorIdentityConfig)
+    # Admin-fixed values some operations need (e.g. a SharePoint site_id or
+    # list_id): injected server-side, never chosen by the model.
+    settings: dict[str, str] = Field(default_factory=dict)
     # type: rest -> full OperationSpec entries; a preset -> OperationRef entries.
     operations: list[OperationSpec | OperationRef] = Field(min_length=1)
 
@@ -318,6 +323,7 @@ class ConnectorConfig(_Strict):
         duplicates = sorted({n for n in names if names.count(n) > 1})
         if duplicates:
             raise ValueError(f"connector '{self.name}' lists duplicate operations: {duplicates}")
+        self._check_settings()
         for op in self.resolved_operations():
             if len(tool_name(self.name, op.name)) > MAX_TOOL_NAME_LENGTH:
                 raise ValueError(
@@ -325,6 +331,28 @@ class ConnectorConfig(_Strict):
                     f"name is longer than {MAX_TOOL_NAME_LENGTH} characters"
                 )
         return self
+
+    def _check_settings(self) -> None:
+        for key, value in self.settings.items():
+            if not IDENTIFIER_RE.fullmatch(key):
+                raise ValueError(f"connector '{self.name}': setting name '{key}' is invalid")
+            if not value or len(value) > 512 or _CONTROL_RE.search(value):
+                raise ValueError(
+                    f"connector '{self.name}': setting '{key}' must be 1-512 printable characters"
+                )
+        for op in self.resolved_operations():
+            for param in op.setting_params().values():
+                value = self.settings.get(param.setting or "")
+                if value is None:
+                    raise ValueError(
+                        f"connector '{self.name}' operation '{op.name}' needs settings."
+                        f"{param.setting}"
+                    )
+                if param.raw and not IDENTIFIER_RE.fullmatch(value):
+                    raise ValueError(
+                        f"connector '{self.name}': setting '{param.setting}' is used as a field "
+                        "name, so it must be a plain identifier (letters, digits, _)"
+                    )
 
     def resolved_operations(self) -> list[OperationSpec]:
         """Every enabled operation as a full spec: inline ones as written,

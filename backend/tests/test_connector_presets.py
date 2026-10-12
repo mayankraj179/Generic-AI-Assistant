@@ -686,7 +686,7 @@ async def test_hrms_profile_keeps_only_work_fields_for_the_caller():
     remote = Remote(_hrms_route)
     _bind(remote, _hrms())
     result = await execute_tool("hrms__get_employee_profile", {"employee_id": BOB})
-    assert remote.requests[-1].url.raw_path.decode() == "/api/v1/employees/alice%40example.test"
+    assert remote.requests[-1].url.raw_path.decode() == "/api/v1/employees/alice@example.test"
     data = result["data"]
     assert data["display_name"] == "Alice" and data["manager.display_name"] == "Mgr"
     assert "salary" not in json.dumps(data) and "national_id" not in json.dumps(data)

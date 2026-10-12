@@ -30,6 +30,7 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _PARAM_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_.$-]*$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9_-]+:[A-Za-z0-9_.-]+$")
 _PLACEHOLDER_RE = re.compile(r"\{([^{}]*)\}")
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # Static headers are for things like Accept or ConsistencyLevel. Anything that
 # looks like a credential belongs in ``auth`` (env var references only).
 _FORBIDDEN_HEADER_RE = re.compile(
@@ -72,6 +73,13 @@ class ParamSpec(_Strict):
     enum: list[str | int | float] | None = None
     identity: bool = False
     claim: str | None = None
+    # The value comes from the connector's ``settings`` (fixed by an admin in
+    # config, e.g. a SharePoint site or list id). Hidden from the model, like
+    # identity; anything the model sends for it is ignored.
+    setting: str | None = None
+    # Only with ``setting`` in a template: inserted unquoted, as a field name
+    # (e.g. an OData column). The setting value must be a plain identifier.
+    raw: bool = False
     max_length: int = Field(default=200, gt=0, le=2000)
     # A regex the whole value must match (e.g. an issue key, a case number).
     pattern: str | None = None
@@ -98,7 +106,18 @@ class ParamSpec(_Strict):
             raise ValueError("identity parameters must be strings")
         if self.identity and self.enum is not None:
             raise ValueError("identity parameters cannot have an enum")
+        if self.setting is not None and self.identity:
+            raise ValueError("a parameter is either identity or setting, not both")
+        if self.setting is not None and not IDENTIFIER_RE.fullmatch(self.setting):
+            raise ValueError(f"setting name '{self.setting}' must be an identifier")
+        if self.raw and (self.setting is None or self.location != "template"):
+            raise ValueError("'raw' is only valid on a template parameter taken from a setting")
         return self
+
+    @property
+    def hidden(self) -> bool:
+        """Filled server-side; never shown to or taken from the model."""
+        return self.identity or self.setting is not None
 
     def json_schema(self) -> dict[str, Any]:
         schema: dict[str, Any] = {"type": self.type}
@@ -337,7 +356,7 @@ class OperationSpec(_Strict):
                 f"the 'in: path' parameters {sorted(path_params)}"
             )
         for name in path_params:
-            if name not in self.required and not self.parameters[name].identity:
+            if name not in self.required and not self.parameters[name].hidden:
                 raise ValueError(
                     f"operation '{self.name}': path parameter '{name}' must be required"
                 )
@@ -374,9 +393,13 @@ class OperationSpec(_Strict):
     def identity_params(self) -> dict[str, ParamSpec]:
         return {n: p for n, p in self.parameters.items() if p.identity}
 
+    def setting_params(self) -> dict[str, ParamSpec]:
+        return {n: p for n, p in self.parameters.items() if p.setting is not None}
+
     def model_input_schema(self) -> dict[str, Any]:
-        """The JSON Schema the model sees: identity parameters removed."""
-        visible = {n: p for n, p in self.parameters.items() if not p.identity}
+        """The JSON Schema the model sees: identity and setting parameters
+        removed."""
+        visible = {n: p for n, p in self.parameters.items() if not p.hidden}
         return {
             "type": "object",
             "properties": {n: p.json_schema() for n, p in visible.items()},

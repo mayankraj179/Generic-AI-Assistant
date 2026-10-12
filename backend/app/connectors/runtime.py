@@ -105,6 +105,11 @@ UNREACHABLE_KINDS = frozenset(
         "response_too_large",
     }
 )
+# Kept literal in path values: legal in a path segment and unable to change
+# its structure, but needed as-is by real ids (Graph site ids have commas,
+# drive ids start "b!", /users/{upn} takes an "@"). "/", "?", "#", "%" and
+# ":" (Graph's path-addressing syntax) are always encoded.
+_PATH_SAFE = ",!@"
 _LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;[^,]*\brel="?next"?', re.IGNORECASE)
 _MISSING = object()
 
@@ -402,7 +407,9 @@ class TurnConnectors:
                 operation=spec.name,
                 fields=supplied_identity,
             )
-        values = {k: v for k, v in arguments.items() if k not in identity_params}
+        # Setting parameters are hidden too; a model-sent value is dropped.
+        hidden = identity_params.keys() | spec.setting_params().keys()
+        values = {k: v for k, v in arguments.items() if k not in hidden}
         errors = sorted(
             Draft202012Validator(spec.model_input_schema()).iter_errors(values),
             key=lambda e: list(e.path),
@@ -412,6 +419,8 @@ class TurnConnectors:
 
         for pname, param in identity_params.items():
             values[pname] = self._identity_value(param.claim or connector.identity.claim)
+        for pname, param in spec.setting_params().items():
+            values[pname] = connector.settings[param.setting or ""]
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + spec.timeout_seconds
@@ -442,14 +451,15 @@ class TurnConnectors:
                 continue
             value = values[pname]
             if param.location == "path":
-                path = path.replace("{" + pname + "}", quote(str(value), safe=""))
+                path = path.replace("{" + pname + "}", quote(str(value), safe=_PATH_SAFE))
             elif param.location == "query":
                 query[pname] = _query_value(value)
             elif param.location == "body":
                 body[pname] = value
         for tname, template in spec.templates.items():
             # Template parameters reach the request only here, escaped.
-            text = render_template(template, values)
+            raw = {n for n, p in spec.parameters.items() if p.raw}
+            text = render_template(template, values, raw)
             if template.location == "query":
                 query[tname] = text
             else:

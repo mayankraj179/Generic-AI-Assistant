@@ -425,7 +425,8 @@ ingested documents. Connectors are **read-only**, so there is no confirmation ga
 | ServiceNow | preset `servicenow` | built, mock-tested | An instance (a free PDI works) + read-only integration user |
 | Salesforce | preset `salesforce` | built, mock-tested | An org (a Developer Edition works) + connected app |
 | Any HRMS | template `configs/examples/connectors/hrms_generic.yaml` (`type: rest`) | built, mock-tested | The HRMS vendor; then its real paths and field names |
-| Microsoft Graph / SharePoint | presets | not built yet (phase 3) | |
+| Microsoft Graph (profile, manager, OneDrive metadata) | preset `microsoft_graph` | built, mock-tested | An Entra app registration with admin consent; confirm the identity claim resolves in `/users/{id}` |
+| SharePoint (list items, library item metadata) | preset `microsoft_graph` | built, mock-tested | A site, list and library to point at, and a `Sites.Selected` grant on that site |
 | SAP (OData) | presets | not built yet (phase 4) | |
 
 "Live-verified" is used only after a real call to the real system. No system has been
@@ -482,6 +483,21 @@ connectors:
       - {name: my_issues, required_labels: ["role:employee"]}
       - {name: get_issue, required_labels: ["role:employee"]}
 ```
+
+### Settings: admin-fixed values
+
+Some operations need values that are fixed per deployment and must never be chosen by the
+model, for example which SharePoint site or list to read. A parameter with
+`setting: <name>` takes its value from the connector's `settings:` map. Like identity,
+it is server-injected, hidden from the model's schema, and dropped if the model sends it.
+A missing setting for an enabled operation fails config loading. A setting with
+`raw: true` is inserted unquoted into a template as a field name (e.g. an OData column),
+so its value must be a plain identifier.
+
+Path values (identity, settings and model parameters alike) are percent-encoded. `/`, `?`,
+`#`, `%` and `:` are always encoded. `,`, `!` and `@` stay literal, because real ids
+need them: Graph site ids contain commas, drive ids start with `b!`, and `/users/{upn}`
+has an `@`.
 
 ### Query templates (JQL, SOQL, ServiceNow, OData)
 
@@ -593,6 +609,85 @@ registration, read-only scopes or roles, and a decision on which JWT claim maps 
 user's id there. A deployment also needs real `required_labels` (roles) in the access
 token. In local dev every user gets the same default labels, so they don't separate users.
 
+### Microsoft Graph and SharePoint (`microsoft_graph`)
+
+```yaml
+connectors:
+  - name: m365
+    type: microsoft_graph
+    display_name: Microsoft 365
+    base_url: https://graph.microsoft.com/v1.0
+    auth:
+      method: oauth_client_credentials
+      token_url: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
+      client_id: ${GRAPH_CLIENT_ID}
+      client_secret: ${GRAPH_CLIENT_SECRET}
+      scope: https://graph.microsoft.com/.default
+      client_auth: post
+    identity: {claim: email}      # production: an oid or UPN claim (see below)
+    settings:                     # only those the enabled operations need
+      site_id: contoso.sharepoint.com,<site-guid>,<web-guid>
+      list_id: <list-guid>
+      owner_column: EmployeeEmail # a text column holding each row's owner email
+      drive_id: b!...             # the document library's drive id
+      folder_id: <item-id>        # the folder to list
+    operations:
+      - {name: my_profile, required_labels: ["role:employee"]}
+      - {name: my_manager, required_labels: ["role:employee"]}
+```
+
+| Operation | Reads | Scoped by |
+|---|---|---|
+| `my_profile` | `/users/{user}`: name, job title, department, office, email, phones, employee id | identity |
+| `my_manager` | `/users/{user}/manager`: name, title, department, email, office | identity |
+| `my_drive_items` | `/users/{user}/drive/root/children`: name, link, size, modified (metadata only) | identity |
+| `list_items` | items of the configured list (`expand=fields`), newest first | settings (`site_id`, `list_id`) and labels: every caller sees the same rows |
+| `my_list_items` | the configured list's rows whose `owner_column` equals the caller's email | identity and settings |
+| `library_folder_items` | children of the configured library folder (metadata only) | settings (`drive_id`, `folder_id`) and labels: shared |
+| `get_library_item` | one item's metadata in the configured library, by id (pattern-checked) | settings and labels: shared |
+
+- **Auth.** Entra ID client credentials (an app registration and client secret). Tokens
+  are cached until shortly before expiry and refreshed after a 401. Certificate
+  credentials (private-key JWT client assertion, Microsoft's recommendation for
+  production) aren't supported yet.
+- **Paging and throttling.** `@odata.nextLink` is followed only on
+  `graph.microsoft.com/v1.0`. On 429 and 503, `Retry-After` is honoured. A 429 without
+  it backs off 1s then 2s, within the operation's timeout. Sustained throttling returns
+  `rate_limited`.
+- **App-only access.** It ignores each user's own SharePoint and OneDrive permissions.
+  Scoping comes only from identity, admin-fixed settings and labels. Use `list_items` and
+  the library operations only for lists and folders every permitted user may see. For
+  `my_list_items`, index `owner_column` in SharePoint: the operation sends
+  `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly`, but an index keeps it reliable.
+
+**SharePoint documents belong in an ingested knowledge source, not a live connector.**
+Live connectors suit list and record data: a row, a status, a profile field, a file's
+metadata. Document *content* is better ingested. Retrieval then filters every chunk by the
+caller's labels, so the permission travels with the document. The connector above runs
+app-only and would ignore SharePoint's own per-document permissions. This framework has no
+SharePoint knowledge source yet. Building one means syncing a library through Graph and
+mapping each document's SharePoint permissions (site groups, sharing links) to
+`access_labels`. Until then, export documents to a filesystem or object-storage source
+with explicit labels.
+
+| Graph permission (application) | Needed for | Notes |
+|---|---|---|
+| `User.Read.All` | `my_profile`, `my_manager` | Reads every user's profile; the identity parameter is what limits it to the caller |
+| `Files.Read.All` | `my_drive_items` | Tenant-wide read of all OneDrives. Leave the operation off unless you need it |
+| `Sites.Selected` (preferred) or `Sites.Read.All` | `list_items`, `my_list_items`, library operations | With `Sites.Selected`, an admin grants `read` on just the configured site (`POST /sites/{site-id}/permissions`) |
+
+Approvals: an Entra app registration, a client secret (or, later, a certificate), and
+**admin consent** for the application permissions above. Plus, for `Sites.Selected`, a
+per-site read grant by a SharePoint/Entra admin.
+
+Assumptions (not yet checked against a real tenant):
+- `/users/{id}` accepts the caller's email only where `mail` equals the
+  `userPrincipalName`. Production should map the Entra object id (`oid`) or UPN claim.
+- A user with no manager gets a 404 from `/manager`, reported as `not_found`.
+- List rows are returned with `expand=fields`. The owner column is a single-line text
+  column holding an email, not a Person column (those return lookup ids).
+- Graph accepts site and drive ids literally in the path (`,` and `!` unencoded).
+
 ### Identity claim: `email` is a development default
 
 Presets and templates default to `identity.claim: email`, and every connector can set its
@@ -602,8 +697,8 @@ the token says `email_verified: true`. **Production should map an immutable empl
 claim from the IdP** (for example a Keycloak user-attribute mapper, or Entra's
 `employeeId` / `onPremisesImmutableId`) and set `identity.claim` to it. It also needs the
 external system's records keyed or searchable by that id: Atlassian accountId, ServiceNow
-`employee_number` or `user_name`, Salesforce `FederationIdentifier`, or the HRMS employee
-number.
+`employee_number` or `user_name`, Salesforce `FederationIdentifier`, Entra object id or UPN
+for Graph, or the HRMS employee number.
 
 ### Per-system credentials, scopes and approvals
 

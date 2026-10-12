@@ -22,7 +22,7 @@ import re
 from typing import Any
 
 from app.connectors.auth import ConnectorCallError
-from app.connectors.spec import TemplateLanguage, TemplateSpec
+from app.connectors.spec import IDENTIFIER_RE, TemplateLanguage, TemplateSpec
 
 _PLACEHOLDER_RE = re.compile(r"\{([^{}]*)\}")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -49,15 +49,29 @@ def literal(value: Any, language: TemplateLanguage) -> str:
     return text
 
 
-def render(template: TemplateSpec, values: dict[str, Any]) -> str:
+def _value(
+    name: str, values: dict[str, Any], raw: set[str] | frozenset[str], template: TemplateSpec
+) -> str:
+    if name in raw:
+        text = str(values[name])
+        if not IDENTIFIER_RE.fullmatch(text):
+            raise ConnectorCallError(
+                "invalid_arguments", "a field-name setting is not an identifier"
+            )
+        return text
+    return literal(values[name], template.language)
+
+
+def render(
+    template: TemplateSpec, values: dict[str, Any], raw: set[str] | frozenset[str] = frozenset()
+) -> str:
     """Joins the parts whose placeholders all have values, each placeholder
-    replaced by its escaped literal."""
+    replaced by its escaped literal. ``raw`` names admin-set field names
+    (identifiers, checked at config load and again here) inserted unquoted."""
     kept = []
     for part in template.parts:
         names = _PLACEHOLDER_RE.findall(part)
         if any(values.get(name) is None for name in names):
             continue
-        kept.append(
-            _PLACEHOLDER_RE.sub(lambda m: literal(values[m.group(1)], template.language), part)
-        )
+        kept.append(_PLACEHOLDER_RE.sub(lambda m: _value(m.group(1), values, raw, template), part))
     return template.separator.join(kept)

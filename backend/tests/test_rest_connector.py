@@ -286,7 +286,9 @@ async def test_model_cannot_inject_a_host_through_a_path_parameter():
 
     (request,) = remote.requests
     assert request.url.host == "api.example.test"
-    assert request.url.raw_path.decode().startswith("/v2/users/alice/tickets/%40evil.test%2F")
+    assert request.url.raw_path.decode() == (
+        "/v2/users/alice/tickets/@evil.test%2F..%2F..%2Fadmin%3Fx%3D1%23"
+    )
     assert request.url.query == b""
 
 
@@ -782,3 +784,20 @@ def test_page_size_must_be_below_max_items():
     )
     with pytest.raises(ValidationError, match="no second page"):
         ConnectorConfig.model_validate(_connector([op]))
+
+
+@pytest.mark.asyncio
+async def test_path_values_keep_id_characters_but_encode_structure():
+    params = {"user": {"in": "path", "identity": True}, "ticket_id": {"in": "path"}}
+    op = _op(
+        name="get_ticket",
+        path="/users/{user}/tickets/{ticket_id}",
+        parameters=params,
+        required=["ticket_id"],
+        response={},
+    )
+    remote = Remote(lambda r: _ok({"id": 1}))
+    _bind(remote, ops=[op])
+    await execute_tool("tickets__get_ticket", {"ticket_id": "host,a1,b2!x@y:root:/z%2F"})
+    raw = remote.requests[0].url.raw_path.decode()
+    assert raw == "/v2/users/alice/tickets/host,a1,b2!x@y%3Aroot%3A%2Fz%252F"
