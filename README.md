@@ -419,6 +419,7 @@ ingested documents. Connectors are **read-only**, so there is no confirmation ga
 | System | Connector | Status | What's still needed |
 |---|---|---|---|
 | Any REST/JSON API | `type: rest` (operations in YAML) | built, mock-tested | A real system to point it at |
+| Any other REST/OData system, YAML only (worked example: room bookings) | `type: rest`, `configs/examples/connectors/room_bookings.yaml` | built, mock-tested | Your system's real paths and fields; the example API is hypothetical |
 | Mock HR API (dev only) | preset `hr_api` | built, mock-tested | Not a real system. Also run end to end against `scripts/mock_hr_api.py` |
 | Jira Cloud | preset `jira_cloud` | built, mock-tested | A site + integration account; confirm email works in JQL or switch to an accountId claim |
 | Jira Data Center / Server | preset `jira_data_center` | built, mock-tested | An instance + PAT; confirm the identity claim matches Jira usernames |
@@ -429,9 +430,12 @@ ingested documents. Connectors are **read-only**, so there is no confirmation ga
 | SharePoint (list items, library item metadata) | preset `microsoft_graph` | built, mock-tested | A site, list and library to point at, and a `Sites.Selected` grant on that site |
 | SAP S/4HANA (OData v2) | preset `sap_s4hana` | built, mock-tested | A system (on-prem or Cloud), a read-only technical user or OAuth client, the `sap-client`, and an IdP claim with the SAP user name |
 | SAP SuccessFactors (OData v2) | preset `sap_successfactors` | built, mock-tested | A tenant and API user (Basic) or an externally issued token; OAuth (SAML bearer) not built |
-
 "Live-verified" is used only after a real call to the real system. No system has been
 live-verified yet.
+
+Not connectors: databases go through the existing `database` knowledge source (ingested,
+not live; see "Database sources"). Systems that ship an MCP server aren't supported (see
+"MCP servers" below).
 
 ### How it fits
 
@@ -549,7 +553,10 @@ These are POST operations allowed because they only search or query:
 
 | Connector | Operation | Why POST |
 |---|---|---|
-| none | | No preset needs one: Jira, ServiceNow and Salesforce all search over GET. Any future `read_only_post` operation gets listed here. |
+| `rooms` (worked example, `configs/examples/connectors/room_bookings.yaml`) | `find_free_rooms` | The availability search takes its time window in a JSON body. It reserves nothing |
+
+No shipped preset needs `read_only_post`: Jira, ServiceNow, Salesforce, Graph and SAP all
+read over GET. Any new `read_only_post` operation gets a row here, with the reason.
 
 ### At request time
 
@@ -751,6 +758,73 @@ Further assumptions:
   connector that filters `userId eq` with a userId claim.
 - Reads need no CSRF token (SAP Gateway only asks for one on modifying requests, which
   connectors never send).
+
+### Adding any other system (YAML only)
+
+Most systems need no code: a `type: rest` connector describes the API in YAML. Pick the
+route first:
+
+| The data lives in… | Use | Why |
+|---|---|---|
+| A database you can query (any engine) | The existing **`database` knowledge source** ("Database sources" above) | Reviewed, parameterised `SELECT`s synced on demand, with access labels per source. Read-only by construction. There is **no live SQL connector**: `named_queries` in an assistant config is parsed but never executed |
+| Documents (policies, manuals, SharePoint libraries) | A **knowledge source** (filesystem, object storage) | Retrieval filters every chunk by the caller's labels, so permissions travel with the content |
+| A REST or OData API, for per-user records or live status | A **connector**: a preset if one fits, else `type: rest` | Live, scoped to the caller, nothing stored |
+| A system that already ships an MCP server | Not supported yet; see "MCP servers" below | |
+
+**Worked example: a room booking system.**
+`backend/configs/examples/connectors/room_bookings.yaml` adds a (hypothetical) booking API
+in YAML only. Its test, `backend/tests/test_connector_worked_example.py`, is the template
+for testing any new connector.
+
+1. **Confirm it's read-only.** List the endpoints you need. Each must be a GET, or a POST
+   that only searches (`read_only_post: true`, then add it to the table above). Anything
+   that creates, changes or deletes is out of scope.
+2. **Pick auth and put secrets in the environment.** Here it's
+   `{method: api_key, header: X-Api-Key, key: ${ROOMS_API_KEY}}`. Use a dedicated,
+   read-only integration credential.
+3. **Decide how a record belongs to a user.** Here a booking has an `organizer` email, so
+   the identity parameter is `organizer: {in: query, identity: true}`. **Never fetch by a
+   model-supplied id alone.** The service credential can read everyone's records, so
+   `GET /bookings/{id}` would let user A read user B's booking. The example's
+   `get_booking` instead asks the list endpoint for `id` AND `organizer`, so someone else's
+   id finds nothing.
+4. **Describe each operation.** Give it a `path` relative to `base_url` and the
+   `parameters` the model may set, narrowed with `enum`, `pattern`, `minimum`/`maximum`
+   and `max_length`. Static values go in `fixed_query`/`fixed_body`. Keep only the
+   `response.fields` an answer needs (the example drops `billing_code` and
+   `cost_centre`). Add `pagination` (offset, cursor, Link header or next-link) and a
+   `timeout_seconds` and `max_response_bytes` that fit.
+5. **If the system takes a query language**, use a `templates:` entry (JQL, SOQL,
+   ServiceNow, OData `$filter`) rather than a free-text parameter. For OData v4 (e.g. newer
+   S/4HANA services), the pattern is the `$filter` template from the SAP preset with
+   `pagination: {strategy: odata_next_link}`. For admin-fixed ids (a site, a list, a
+   client number) use `settings:`.
+6. **Set `required_labels`** to the roles that may call each operation (all of them must
+   be held).
+7. **Check it:** `cd backend && python -m app.connectors.check <file>.yaml`. It validates
+   the file (all the load-time rules above), then prints, per tool:
+   - the request it builds;
+   - exactly what the model can set;
+   - what is filled server-side;
+   - the labels it needs;
+   - whether each referenced env var is set (names only).
+   It makes no network calls.
+8. **Test it against a mock**, copying `test_connector_worked_example.py`. Cover the happy
+   path, the field projection, and **cross-user isolation**: two principals, each must only
+   see their own records even when the model passes the other's id.
+9. **Enable it** in an assistant config's `connectors:` list. Mark it "live-verified" in
+   the status table only after a real call to the real system.
+
+### MCP servers (an option, not built)
+
+For a system that already ships an MCP server, an MCP client could be an alternative to
+writing operations in YAML. It isn't built in this framework. If it were, the rules above
+would carry over:
+- Only tools the server marks read-only (`readOnlyHint: true`) would be callable, and
+  only those an admin also allow-lists by name in config. The hint is the server's own
+  claim, so the allow-list is the control.
+- The same identity injection, labels, audit rows, spans and log redaction would apply.
+- Credentials would stay with the server, as in "Why not MCP" above.
 
 ### Identity claim: `email` is a development default
 

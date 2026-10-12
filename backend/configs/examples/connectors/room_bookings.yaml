@@ -1,0 +1,116 @@
+# Worked example (README "Connectors: adding any other system"): a meeting
+# room booking system's REST API, added as YAML only. The API is
+# hypothetical. Its shape (API key header, bookings filterable by organizer
+# email, cursor paging, a POST search endpoint) is typical, but check every
+# path and field against your real system's docs.
+#
+# To use it: copy this mapping into an assistant config's `connectors:`
+# list, set ROOMS_API_KEY in the environment, and run
+#   python -m app.connectors.check <that assistant config>.yaml
+name: rooms
+type: rest
+display_name: Room booking system
+base_url: https://rooms.example.com/api/v1
+auth:
+  method: api_key
+  header: X-Api-Key
+  key: ${ROOMS_API_KEY}
+# Which claim ties a booking to the user. email (verified) is the dev
+# default; production: an immutable employee id, if the system stores one.
+identity:
+  claim: email
+operations:
+  # 1. "My" records: the identity goes in as a filter the system applies.
+  - name: my_bookings
+    description: >-
+      Lists the signed-in user's own room bookings (room, start, end,
+      status), soonest first. Optional: only from a date on, or one status.
+    method: GET
+    path: /bookings
+    parameters:
+      organizer: {in: query, identity: true}
+      from:
+        in: query
+        pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        description: Optional, YYYY-MM-DD; only bookings starting on or after it.
+      status:
+        in: query
+        enum: [confirmed, cancelled]
+        description: Optional, one status.
+    fixed_query:
+      sort: start
+    response:
+      root: data
+      fields: [id, room.name, room.floor, start, end, status]
+      max_items: 40
+    pagination:
+      strategy: cursor
+      cursor_param: cursor
+      cursor_path: meta.next_cursor
+      page_size: 20
+      page_size_param: limit
+      max_pages: 2
+    timeout_seconds: 8
+    max_response_bytes: 200000
+    required_labels: ["role:employee"]
+
+  # 2. One record by id. Never GET /bookings/{id} alone: the service
+  #    credential can read everyone's bookings, so a model-chosen id would
+  #    let user A read user B's booking. Ask the list endpoint for that id
+  #    AND the caller's identity instead; someone else's id finds nothing.
+  - name: get_booking
+    description: >-
+      Gets one of the signed-in user's bookings by its id (from
+      my_bookings), including attendees count and notes.
+    method: GET
+    path: /bookings
+    parameters:
+      organizer: {in: query, identity: true}
+      id:
+        in: query
+        pattern: "^bk_[A-Za-z0-9]{6,32}$"
+        description: The booking id, e.g. bk_7Hq2x9.
+    required: [id]
+    response:
+      root: data
+      fields: [id, room.name, room.floor, start, end, status, attendees_count, notes]
+      max_items: 1
+    timeout_seconds: 8
+    max_response_bytes: 50000
+    required_labels: ["role:employee"]
+
+  # 3. Shared data behind a search endpoint that takes POST: allowed only
+  #    because it declares read_only_post (it reserves nothing). Listed in
+  #    the README's read_only_post table.
+  - name: find_free_rooms
+    description: >-
+      Finds meeting rooms free for a time window, optionally with a minimum
+      capacity. Shared information; it does not book anything.
+    method: POST
+    read_only_post: true
+    path: /rooms/availability/search
+    parameters:
+      start:
+        in: body
+        pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$"
+        description: Window start, YYYY-MM-DDTHH:MM (local time).
+      end:
+        in: body
+        pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$"
+        description: Window end, YYYY-MM-DDTHH:MM (local time).
+      min_capacity:
+        in: body
+        type: integer
+        minimum: 1
+        maximum: 100
+        description: Optional, the smallest room size wanted.
+    required: [start, end]
+    fixed_body:
+      include_unbookable: false
+    response:
+      root: rooms
+      fields: [name, floor, capacity, equipment]
+      max_items: 20
+    timeout_seconds: 8
+    max_response_bytes: 100000
+    required_labels: ["role:employee"]
