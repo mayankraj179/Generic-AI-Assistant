@@ -67,12 +67,20 @@ class AuthenticatedIdentity(BaseModel):
                 "groups": list(groups),
                 "roles": list(roles),
             },
-            identity_claims={
-                str(key): str(value)
-                for key, value in claims.items()
-                if isinstance(value, str | int) and not isinstance(value, bool)
-            },
+            identity_claims=_scalar_claims(claims),
         )
+
+
+def _scalar_claims(claims: Mapping[str, Any]) -> dict[str, str]:
+    """Top-level string/number/boolean claims as strings (booleans as
+    "true"/"false", so email_verified can be checked)."""
+    out: dict[str, str] = {}
+    for key, value in claims.items():
+        if isinstance(value, bool):
+            out[str(key)] = "true" if value else "false"
+        elif isinstance(value, str | int):
+            out[str(key)] = str(value)
+    return out
 
 
 def _normalize_set(value: object) -> frozenset[str]:

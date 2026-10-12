@@ -1,0 +1,158 @@
+# ServiceNow Table API, read operations for incidents and requests. Every
+# query is a reviewed encoded query (sysparm_query) scoped to the signed-in
+# user; the model only fills typed values. Encoded queries have no escaping
+# for '^' (the clause separator), so a value containing one is rejected.
+#
+# base_url: https://<instance>.service-now.com
+# auth: basic (a read-only integration user) or oauth_client_credentials
+#       (an OAuth application registry entry with the client credentials
+#       grant enabled; token_url https://<instance>.service-now.com/oauth_token.do,
+#       client_auth: post).
+# identity: matched on the sys_user email of the caller (incidents) or the
+#       requested-for user (requests): caller_id.email, requested_for.email.
+# Results use display values (sysparm_display_value=true), so states and
+# references come back as readable text.
+type: servicenow
+description: ServiceNow Table API, read-only incidents and requests scoped to the signed-in user.
+auth_methods: [basic, oauth_client_credentials]
+operations:
+  - name: my_incidents
+    description: >-
+      Lists incidents the signed-in user raised (they are the caller), most
+      recently updated first. Optional: active true for open incidents, false
+      for closed ones.
+    method: GET
+    path: /api/now/table/incident
+    parameters:
+      user: {in: template, identity: true}
+      active:
+        in: template
+        type: boolean
+        description: Optional. true for open incidents, false for closed ones.
+    templates:
+      sysparm_query:
+        language: servicenow
+        separator: "^"
+        parts:
+          - "caller_id.email={user}"
+          - "active={active}"
+          - "ORDERBYDESCsys_updated_on"
+    fixed_query:
+      sysparm_fields: number,short_description,state,priority,urgency,assigned_to,assignment_group,sys_updated_on
+      sysparm_display_value: "true"
+      sysparm_exclude_reference_link: "true"
+    response:
+      root: result
+      fields: [number, short_description, state, priority, urgency, assigned_to,
+               assignment_group, sys_updated_on]
+      max_items: 40
+    pagination:
+      strategy: offset
+      offset_param: sysparm_offset
+      page_size: 20
+      page_size_param: sysparm_limit
+      max_pages: 2
+    timeout_seconds: 10
+
+  - name: get_incident
+    description: >-
+      Gets one incident by number (for example INC0010023), only if the
+      signed-in user is its caller.
+    method: GET
+    path: /api/now/table/incident
+    parameters:
+      user: {in: template, identity: true}
+      number:
+        in: template
+        pattern: "^INC[0-9]{7,10}$"
+        description: The incident number, e.g. INC0010023.
+    required: [number]
+    templates:
+      sysparm_query:
+        language: servicenow
+        separator: "^"
+        parts:
+          - "number={number}"
+          - "caller_id.email={user}"
+    fixed_query:
+      sysparm_fields: number,short_description,description,state,priority,urgency,impact,assigned_to,assignment_group,opened_at,sys_updated_on,close_notes
+      sysparm_display_value: "true"
+      sysparm_exclude_reference_link: "true"
+      sysparm_limit: 1
+    response:
+      root: result
+      fields: [number, short_description, description, state, priority, urgency,
+               impact, assigned_to, assignment_group, opened_at, sys_updated_on,
+               close_notes]
+      max_items: 1
+    timeout_seconds: 10
+
+  - name: my_requests
+    description: >-
+      Lists service catalog requests made for the signed-in user, most
+      recently updated first. Optional: active true for open requests, false
+      for closed ones.
+    method: GET
+    path: /api/now/table/sc_request
+    parameters:
+      user: {in: template, identity: true}
+      active:
+        in: template
+        type: boolean
+        description: Optional. true for open requests, false for closed ones.
+    templates:
+      sysparm_query:
+        language: servicenow
+        separator: "^"
+        parts:
+          - "requested_for.email={user}"
+          - "active={active}"
+          - "ORDERBYDESCsys_updated_on"
+    fixed_query:
+      sysparm_fields: number,short_description,request_state,stage,approval,opened_at,sys_updated_on
+      sysparm_display_value: "true"
+      sysparm_exclude_reference_link: "true"
+    response:
+      root: result
+      fields: [number, short_description, request_state, stage, approval, opened_at,
+               sys_updated_on]
+      max_items: 40
+    pagination:
+      strategy: offset
+      offset_param: sysparm_offset
+      page_size: 20
+      page_size_param: sysparm_limit
+      max_pages: 2
+    timeout_seconds: 10
+
+  - name: get_request
+    description: >-
+      Gets one service catalog request by number (for example REQ0010045),
+      only if it was made for the signed-in user.
+    method: GET
+    path: /api/now/table/sc_request
+    parameters:
+      user: {in: template, identity: true}
+      number:
+        in: template
+        pattern: "^REQ[0-9]{7,10}$"
+        description: The request number, e.g. REQ0010045.
+    required: [number]
+    templates:
+      sysparm_query:
+        language: servicenow
+        separator: "^"
+        parts:
+          - "number={number}"
+          - "requested_for.email={user}"
+    fixed_query:
+      sysparm_fields: number,short_description,description,request_state,stage,approval,opened_at,due_date,sys_updated_on
+      sysparm_display_value: "true"
+      sysparm_exclude_reference_link: "true"
+      sysparm_limit: 1
+    response:
+      root: result
+      fields: [number, short_description, description, request_state, stage,
+               approval, opened_at, due_date, sys_updated_on]
+      max_items: 1
+    timeout_seconds: 10

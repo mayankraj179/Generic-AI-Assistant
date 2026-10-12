@@ -65,14 +65,30 @@ class ParamSpec(_Strict):
     the model and anything the model sends for them is ignored."""
 
     type: Literal["string", "integer", "number", "boolean"] = "string"
-    location: Literal["path", "query", "body"] = Field(alias="in")
+    # "template": the value is only ever substituted, escaped, into one of the
+    # operation's reviewed query templates (see TemplateSpec).
+    location: Literal["path", "query", "body", "template"] = Field(alias="in")
     description: str = ""
     enum: list[str | int | float] | None = None
     identity: bool = False
     claim: str | None = None
     max_length: int = Field(default=200, gt=0, le=2000)
+    # A regex the whole value must match (e.g. an issue key, a case number).
+    pattern: str | None = None
     minimum: float | None = None
     maximum: float | None = None
+
+    @field_validator("pattern")
+    @classmethod
+    def _valid_pattern(cls, v: str | None) -> str | None:
+        if v is not None:
+            try:
+                re.compile(v)
+            except re.error as exc:
+                raise ValueError(f"pattern is not a valid regex: {exc}") from None
+            if not (v.startswith("^") and v.endswith("$")):
+                raise ValueError("pattern must be anchored (start with ^ and end with $)")
+        return v
 
     @model_validator(mode="after")
     def _consistent(self) -> ParamSpec:
@@ -92,11 +108,38 @@ class ParamSpec(_Strict):
             schema["enum"] = list(self.enum)
         if self.type == "string":
             schema["maxLength"] = self.max_length
+        if self.pattern is not None:
+            schema["pattern"] = self.pattern
         if self.minimum is not None:
             schema["minimum"] = self.minimum
         if self.maximum is not None:
             schema["maximum"] = self.maximum
         return schema
+
+
+TemplateLanguage = Literal["jql", "soql", "servicenow", "odata"]
+
+
+class TemplateSpec(_Strict):
+    """A reviewed query (JQL, SOQL, a ServiceNow encoded query, an OData
+    $filter) sent as one query or body field. The text is fixed in config;
+    ``{param}`` placeholders take ``in: template`` parameters, which are
+    escaped and quoted as literals of ``language`` (see templates.py), so a
+    value can never change the query's structure. The model never writes
+    query text.
+
+    ``parts`` are joined with ``separator``. A part is kept only when every
+    placeholder in it has a value, so optional filters go in their own part.
+    Put the user-scoping clause (with the identity placeholder) in a part of
+    its own: identity always has a value, so that part is always present."""
+
+    location: Literal["query", "body"] = Field(default="query", alias="in")
+    language: TemplateLanguage
+    parts: list[str] = Field(min_length=1)
+    separator: str = " "
+
+    def placeholders(self) -> set[str]:
+        return {name for part in self.parts for name in _PLACEHOLDER_RE.findall(part)}
 
 
 class ResponseSpec(_Strict):
@@ -117,7 +160,12 @@ class PaginationSpec(_Strict):
     own base URL; offset and cursor values go in the query for GET and in the
     body for a read_only_post operation."""
 
-    strategy: Literal["none", "offset", "cursor", "link_header", "odata_next_link"] = "none"
+    # next_link: a next-page URL in the body at next_link_path (e.g.
+    # Salesforce's nextRecordsUrl); odata_next_link is the same with OData's
+    # default path.
+    strategy: Literal["none", "offset", "cursor", "link_header", "odata_next_link", "next_link"] = (
+        "none"
+    )
     max_pages: int = Field(default=3, ge=1, le=20)
     page_size: int | None = Field(default=None, gt=0, le=1000)
     page_size_param: str | None = None
@@ -133,7 +181,13 @@ class PaginationSpec(_Strict):
             raise ValueError("cursor pagination needs cursor_path (where the next cursor is)")
         if self.page_size_param and self.page_size is None:
             raise ValueError("page_size_param needs page_size")
+        if self.strategy == "next_link" and "next_link_path" not in self.model_fields_set:
+            raise ValueError("next_link pagination needs next_link_path")
         return self
+
+    @property
+    def follows_links(self) -> bool:
+        return self.strategy in ("link_header", "odata_next_link", "next_link")
 
     def control_params(self) -> set[str]:
         names = {self.page_size_param} if self.page_size_param else set()
@@ -154,6 +208,7 @@ class OperationSpec(_Strict):
     required: list[str] = Field(default_factory=list)
     fixed_query: dict[str, Scalar] = Field(default_factory=dict)
     fixed_body: dict[str, Any] = Field(default_factory=dict)
+    templates: dict[str, TemplateSpec] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
     response: ResponseSpec = Field(default_factory=ResponseSpec)
     pagination: PaginationSpec = Field(default_factory=PaginationSpec)
@@ -219,12 +274,18 @@ class OperationSpec(_Strict):
                 )
         if self.fixed_body and self.method != "POST":
             raise ValueError(f"operation '{self.name}': fixed_body needs a POST operation")
+        self._check_templates()
         unknown_required = sorted(set(self.required) - self.parameters.keys())
         if unknown_required:
             raise ValueError(
                 f"operation '{self.name}': required names unknown parameters: {unknown_required}"
             )
-        reserved = set(self.fixed_query) | set(self.fixed_body) | self.pagination.control_params()
+        reserved = (
+            set(self.fixed_query)
+            | set(self.fixed_body)
+            | set(self.templates)
+            | self.pagination.control_params()
+        )
         clash = sorted(reserved & self.parameters.keys())
         if clash:
             raise ValueError(
@@ -235,7 +296,18 @@ class OperationSpec(_Strict):
             raise ValueError(
                 f"operation '{self.name}': pagination needs response.root (the record list)"
             )
-        if self.pagination.strategy in ("link_header", "odata_next_link") and self.method != "GET":
+        page_size = self.pagination.page_size
+        if (
+            self.pagination.strategy != "none"
+            and page_size
+            and page_size >= self.response.max_items
+        ):
+            raise ValueError(
+                f"operation '{self.name}': pagination.page_size ({page_size}) must be smaller "
+                f"than response.max_items ({self.response.max_items}), or no second page is "
+                "ever fetched"
+            )
+        if self.pagination.follows_links and self.method != "GET":
             raise ValueError(
                 f"operation '{self.name}': {self.pagination.strategy} pagination is GET-only"
             )
@@ -269,6 +341,35 @@ class OperationSpec(_Strict):
                 raise ValueError(
                     f"operation '{self.name}': path parameter '{name}' must be required"
                 )
+
+    def _check_templates(self) -> None:
+        template_params = {n for n, p in self.parameters.items() if p.location == "template"}
+        used: set[str] = set()
+        for tname, template in self.templates.items():
+            if template.location == "body" and self.method != "POST":
+                raise ValueError(
+                    f"operation '{self.name}': body template '{tname}' needs a POST operation"
+                )
+            unknown = sorted(template.placeholders() - template_params)
+            if unknown:
+                raise ValueError(
+                    f"operation '{self.name}': template '{tname}' uses {unknown}, which are "
+                    "not 'in: template' parameters"
+                )
+            if template.language == "soql":
+                text = template.separator.join(template.parts)
+                if not text.lstrip().upper().startswith("SELECT ") or ";" in text:
+                    raise ValueError(
+                        f"operation '{self.name}': SOQL template '{tname}' must be a single "
+                        "SELECT statement"
+                    )
+            used |= template.placeholders()
+        unused = sorted(template_params - used)
+        if unused:
+            raise ValueError(
+                f"operation '{self.name}': 'in: template' parameters {unused} are not used by "
+                "any template"
+            )
 
     def identity_params(self) -> dict[str, ParamSpec]:
         return {n: p for n, p in self.parameters.items() if p.identity}

@@ -1,0 +1,93 @@
+# Atlassian Jira Cloud, REST API v3. Read-only: both operations use the
+# enhanced JQL search (GET /rest/api/3/search/jql, cursor-paged with
+# nextPageToken). Every query is a reviewed JQL template scoped to the
+# signed-in user; the model only fills typed, escaped values.
+#
+# base_url: https://<your-site>.atlassian.net
+# auth: basic (integration account email + API token) or bearer (OAuth 2.0
+#       access token).
+# identity: JQL user fields accept an email only where that user's email is
+#       visible to the integration account; otherwise map an Atlassian
+#       accountId claim from the IdP and set identity.claim to it.
+type: jira_cloud
+description: Jira Cloud (REST API v3), read-only issue search scoped to the signed-in user.
+auth_methods: [basic, bearer]
+operations:
+  - name: my_issues
+    description: >-
+      Searches Jira issues assigned to or reported by the signed-in user,
+      most recently updated first. Optional filters: status category,
+      project key, and words to search for.
+    method: GET
+    path: /rest/api/3/search/jql
+    parameters:
+      user: {in: template, identity: true}
+      status_category:
+        in: template
+        enum: [To Do, In Progress, Done]
+        description: Optional, one status category.
+      project:
+        in: template
+        pattern: "^[A-Z][A-Z0-9_]{1,19}$"
+        description: Optional, a project key such as HR or IT.
+      text:
+        in: template
+        max_length: 100
+        description: Optional, words to search for in the issue text.
+    templates:
+      jql:
+        language: jql
+        parts:
+          - "(assignee = {user} OR reporter = {user})"
+          - "AND statusCategory = {status_category}"
+          - "AND project = {project}"
+          - "AND text ~ {text}"
+          - "ORDER BY updated DESC"
+    fixed_query:
+      fields: summary,status,priority,issuetype,assignee,reporter,updated
+    response:
+      root: issues
+      fields: [key, fields.summary, fields.status.name, fields.priority.name,
+               fields.issuetype.name, fields.assignee.displayName,
+               fields.reporter.displayName, fields.updated]
+      max_items: 40
+    pagination:
+      strategy: cursor
+      cursor_param: nextPageToken
+      cursor_path: nextPageToken
+      page_size: 20
+      page_size_param: maxResults
+      max_pages: 2
+    timeout_seconds: 10
+    max_response_bytes: 500000
+
+  - name: get_issue
+    description: >-
+      Gets one Jira issue by its key (for example IT-123), only if it is
+      assigned to or reported by the signed-in user.
+    method: GET
+    path: /rest/api/3/search/jql
+    parameters:
+      user: {in: template, identity: true}
+      issue_key:
+        in: template
+        pattern: "^[A-Z][A-Z0-9_]{1,19}-[0-9]{1,9}$"
+        description: The issue key, e.g. IT-123.
+    required: [issue_key]
+    templates:
+      jql:
+        language: jql
+        parts:
+          - "key = {issue_key}"
+          - "AND (assignee = {user} OR reporter = {user})"
+    fixed_query:
+      fields: summary,status,priority,issuetype,assignee,reporter,created,updated,duedate,resolution,labels
+    response:
+      root: issues
+      fields: [key, fields.summary, fields.status.name, fields.priority.name,
+               fields.issuetype.name, fields.assignee.displayName,
+               fields.reporter.displayName, fields.created, fields.updated,
+               fields.duedate, fields.resolution.name, fields.labels]
+      max_items: 1
+    timeout_seconds: 10
+    max_response_bytes: 200000

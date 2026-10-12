@@ -61,7 +61,11 @@ def _principal(user: str = "alice", labels=("role:authenticated",)) -> Principal
         principal_id=f"sub-{user}",
         labels=frozenset(labels),
         clearance=1,
-        claims={"preferred_username": user, "email": f"{user}@example.test"},
+        claims={
+            "preferred_username": user,
+            "email": f"{user}@example.test",
+            "email_verified": "true",
+        },
     )
 
 
@@ -769,3 +773,12 @@ async def test_label_denial_makes_no_request():
     assert turn.authorized_tool_names() == []
     assert (await execute_tool(TOOL, {}))["error_kind"] == "denied"
     assert remote.requests == []
+
+
+def test_page_size_must_be_below_max_items():
+    op = _op(
+        response={"root": "data", "max_items": 20},
+        pagination={"strategy": "offset", "page_size": 20, "page_size_param": "limit"},
+    )
+    with pytest.raises(ValidationError, match="no second page"):
+        ConnectorConfig.model_validate(_connector([op]))

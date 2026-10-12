@@ -9,8 +9,10 @@ Read-only, like the connector that calls it:
                            client_id/client_secret). Issues a short-lived
                            bearer token.
   GET  /api/v1/employees/{employee_id}/leave-balance[?leave_type=annual]
-                           Requires that bearer token. 404 for an unknown
-                           employee.
+  GET  /api/v1/employees/{employee_id}
+                           Require that bearer token. 404 for an unknown
+                           employee. Employees are keyed by email
+                           (dev_user@example.com, dev_user_b@example.com).
 
 The service credential is HR_API_CLIENT_ID / HR_API_CLIENT_SECRET, read from
 the environment or backend/.env: the same values the backend sends.
@@ -40,18 +42,47 @@ from fastapi.responses import JSONResponse
 _ENV = dotenv_values(Path(__file__).resolve().parent.parent / ".env")
 TOKEN_TTL_SECONDS = int(os.environ.get("MOCK_HR_TOKEN_TTL_SECONDS", "300"))
 
-# Keyed by the id the backend maps from the JWT claim (preferred_username in
-# the example config).
+# Keyed by the id the backend maps from the JWT claim: the verified email in
+# the example config (a dev default; production would use an employee id).
 EMPLOYEES: dict[str, dict] = {
-    "dev_user": {
+    "dev_user@example.com": {
         "annual": {"available_days": 14.5, "used_days": 6.5, "accrued_days": 21.0},
         "sick": {"available_days": 9.0, "used_days": 3.0, "accrued_days": 12.0},
         "casual": {"available_days": 4.0, "used_days": 2.0, "accrued_days": 6.0},
     },
-    "dev_user_b": {
+    "dev_user_b@example.com": {
         "annual": {"available_days": 3.0, "used_days": 18.0, "accrued_days": 21.0},
         "sick": {"available_days": 12.0, "used_days": 0.0, "accrued_days": 12.0},
         "casual": {"available_days": 1.0, "used_days": 5.0, "accrued_days": 6.0},
+    },
+}
+
+# Work profiles, plus fields a connector must never pass on (salary,
+# national_id, home_address), so data minimisation can be checked.
+PROFILES: dict[str, dict] = {
+    "dev_user@example.com": {
+        "display_name": "Dev User",
+        "job_title": "Software Engineer",
+        "department": "Engineering",
+        "location": "Pune",
+        "manager": {"display_name": "Asha Rao", "email": "asha.rao@example.com"},
+        "start_date": "2023-04-03",
+        "employment_type": "full_time",
+        "salary": 1850000,
+        "national_id": "XXXX-1234",
+        "home_address": "12 Example Lane",
+    },
+    "dev_user_b@example.com": {
+        "display_name": "Dev UserB",
+        "job_title": "HR Specialist",
+        "department": "People",
+        "location": "Mumbai",
+        "manager": {"display_name": "Ravi Iyer", "email": "ravi.iyer@example.com"},
+        "start_date": "2021-09-15",
+        "employment_type": "full_time",
+        "salary": 1420000,
+        "national_id": "XXXX-9876",
+        "home_address": "34 Sample Road",
     },
 }
 
@@ -129,6 +160,17 @@ async def leave_balance(
         "as_of": date.today().isoformat(),
         "balances": [{"leave_type": t, **record[t]} for t in types],
     }
+
+
+@app.get("/api/v1/employees/{employee_id}")
+async def employee_profile(employee_id: str, authorization: str | None = Header(default=None)):
+    _require_token(authorization)
+    _requested.append(employee_id)
+    print(f"mock-hr: profile requested for employee_id={employee_id!r}", flush=True)
+    profile = PROFILES.get(employee_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+    return {"employee_id": employee_id, **profile}
 
 
 @app.post("/__mock/faults")

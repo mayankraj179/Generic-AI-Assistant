@@ -420,7 +420,11 @@ ingested documents. Connectors are **read-only**, so there is no confirmation ga
 |---|---|---|---|
 | Any REST/JSON API | `type: rest` (operations in YAML) | built, mock-tested | A real system to point it at |
 | Mock HR API (dev only) | preset `hr_api` | built, mock-tested | Not a real system. Also run end to end against `scripts/mock_hr_api.py` |
-| Jira, ServiceNow, Salesforce, HRMS | presets | not built yet (phase 2) | |
+| Jira Cloud | preset `jira_cloud` | built, mock-tested | A site + integration account; confirm email works in JQL or switch to an accountId claim |
+| Jira Data Center / Server | preset `jira_data_center` | built, mock-tested | An instance + PAT; confirm the identity claim matches Jira usernames |
+| ServiceNow | preset `servicenow` | built, mock-tested | An instance (a free PDI works) + read-only integration user |
+| Salesforce | preset `salesforce` | built, mock-tested | An org (a Developer Edition works) + connected app |
+| Any HRMS | template `configs/examples/connectors/hrms_generic.yaml` (`type: rest`) | built, mock-tested | The HRMS vendor; then its real paths and field names |
 | Microsoft Graph / SharePoint | presets | not built yet (phase 3) | |
 | SAP (OData) | presets | not built yet (phase 4) | |
 
@@ -466,6 +470,41 @@ A preset is enabled with `operations: [{name: <op>, required_labels: [...]}]`, o
 with a lower `timeout_seconds` or `max_response_bytes`. A preset's operations can't be
 redefined in an assistant config; write a `type: rest` connector instead.
 
+```yaml
+connectors:
+  - name: jira
+    type: jira_cloud
+    display_name: Jira
+    base_url: https://acme.atlassian.net
+    auth: {method: basic, username: ${JIRA_USER}, password: ${JIRA_API_TOKEN}}
+    identity: {claim: email}            # the default; see "Identity claim" below
+    operations:
+      - {name: my_issues, required_labels: ["role:employee"]}
+      - {name: get_issue, required_labels: ["role:employee"]}
+```
+
+### Query templates (JQL, SOQL, ServiceNow, OData)
+
+Systems that take a query language get **reviewed templates, never model-written
+queries**. The query text is fixed in config. `{param}` placeholders take `in: template`
+parameters, which are escaped and quoted as literals of the template's `language`
+(`backend/app/connectors/templates.py`), so a value can't change the query's structure:
+
+| `language` | A string value becomes | Also rejected |
+|---|---|---|
+| `jql` | `"value"`, with `\` and `"` escaped | control characters |
+| `soql` | `'value'`, with `\`, `'` and `"` escaped | control characters; a template that isn't a single `SELECT` |
+| `odata` | `'value'`, with `'` doubled | control characters |
+| `servicenow` | the bare value (encoded queries have no quoting) | values containing `^` (the clause separator, which has no escape), control characters |
+
+A template is a list of `parts` joined by `separator`. A part is kept only when all its
+placeholders have values, so optional filters each get their own part. The user-scoping
+clause carries the identity placeholder, which always has a value, so that part is always
+sent. Parameters can also declare an anchored `pattern` (issue keys, case numbers), checked
+before anything is sent. Lookups "by key" (Jira `get_issue`, ServiceNow `get_incident`,
+Salesforce `get_case`) are searches that AND the key with the user-scoping clause. Asking
+for someone else's record therefore returns nothing, rather than the record.
+
 ### Rules enforced at config load
 
 - **Read-only.** `method` must be `GET`, or `POST` on an operation that declares
@@ -491,15 +530,17 @@ These are POST operations allowed because they only search or query:
 
 | Connector | Operation | Why POST |
 |---|---|---|
-| none yet | | Presets that need one will be listed here (e.g. phase 2 search endpoints). |
+| none | | No preset needs one: Jira, ServiceNow and Salesforce all search over GET. Any future `read_only_post` operation gets listed here. |
 
 ### At request time
 
 - **Identity.** The user's id comes from a validated JWT claim on the Principal: the
-  connector's `identity.claim`, or a per-parameter `claim`. It is injected server-side.
-  Identity parameters are removed from the schema the model sees. If the model sends one
-  anyway, it is ignored and the audit row notes `connector_identity_argument_ignored`
-  (field names only). A missing claim means no call.
+  connector's `identity.claim` (default `email`), or a per-parameter `claim`. It is
+  injected server-side. Identity parameters are removed from the schema the model sees. If
+  the model sends one anyway, it is ignored and the audit row notes
+  `connector_identity_argument_ignored` (field names only). A missing or empty claim means
+  no call (`identity_unavailable`). When the claim is `email`, the token must also carry
+  `email_verified: true`, or there is no call (`identity_unverified`).
 - **Authorization.** An operation is offered and callable only if the caller holds **all**
   of its required labels. A denied call makes no request.
 - **What the model controls.** Only the declared non-identity parameters, validated against
@@ -516,9 +557,11 @@ These are POST operations allowed because they only search or query:
   `response.max_items`, and the result says `truncated: true` when more existed.
 - **Throttling.** A 429, or a 503 with `Retry-After`, is retried at most twice when the wait
   fits in the operation's timeout. Otherwise the call returns `rate_limited`.
-- **Failures.** A timeout, unreachable or blocked host, 4xx/5xx, unreadable or oversized
-  response, refused redirect or rate limit becomes a structured error for the model
-  ("couldn't be reached, don't guess"). On a turn with no document context, a reply that no
+- **Failures.** A timeout, unreachable or blocked host, 5xx or 401/403, unreadable or
+  oversized response, refused redirect or rate limit becomes a structured error for the
+  model ("couldn't be reached, don't guess"). A 400/422 is `rejected` (the system refused
+  the lookup, e.g. a key that doesn't exist) and a 404 is `not_found`; neither is reported
+  as "couldn't be reached". On a turn with no document context, a reply that no
   successful tool result backs is replaced with "I couldn't reach the live data source
   (…)". A reply with document context gets that notice appended.
 - **Provenance.** Connector answers are not citations. `/chat` returns `live_sources`
@@ -547,10 +590,50 @@ is a separate, server-injected parameter.
 
 **Approvals to plan for, for any system:** a dedicated integration account or app
 registration, read-only scopes or roles, and a decision on which JWT claim maps to the
-user's id there. The default, `preferred_username`, often isn't the right key; an employee
-id or email claim from an IdP mapper usually is. A deployment also needs real
-`required_labels` (roles) in the access token. In local dev every user gets the same
-default labels, so they don't separate users.
+user's id there. A deployment also needs real `required_labels` (roles) in the access
+token. In local dev every user gets the same default labels, so they don't separate users.
+
+### Identity claim: `email` is a development default
+
+Presets and templates default to `identity.claim: email`, and every connector can set its
+own claim. Email is a **development default only**: addresses get renamed and reassigned,
+and an unverified one could be anyone's. The framework refuses to inject an email unless
+the token says `email_verified: true`. **Production should map an immutable employee-id
+claim from the IdP** (for example a Keycloak user-attribute mapper, or Entra's
+`employeeId` / `onPremisesImmutableId`) and set `identity.claim` to it. It also needs the
+external system's records keyed or searchable by that id: Atlassian accountId, ServiceNow
+`employee_number` or `user_name`, Salesforce `FederationIdentifier`, or the HRMS employee
+number.
+
+### Per-system credentials, scopes and approvals
+
+| System | Credential | Scopes / roles the integration account needs | Approvals |
+|---|---|---|---|
+| Jira Cloud | Atlassian account email + API token (`basic`), or an OAuth 2.0 (3LO) access token (`bearer`) | Browse Projects on the projects users should see. If email visibility is restricted, a claim holding the Atlassian accountId instead of email | Atlassian org admin: an integration (bot) account and its API token |
+| Jira Data Center | Personal access token (`bearer`, Jira 8.14+) or username + password (`basic`) | Browse Projects on those projects; read-only account | Jira admin: the account and PAT; usually `allow_private_network: true` (on-prem) |
+| ServiceNow | Integration user (`basic`), or OAuth client credentials (`client_auth: post`, `token_url` `/oauth_token.do`) | Read access to `incident`, `sc_request` and the `sys_user` email used for scoping (e.g. `itil` read or a custom read-only role + table ACLs). For OAuth, an Application Registry entry with the client credentials grant enabled | ServiceNow admin: the user/role, ACLs, OAuth app |
+| Salesforce | Connected app, JWT bearer (`oauth_jwt_bearer`: certificate, consumer key, integration username, audience `https://login.salesforce.com` or `test.salesforce.com`) or client credentials (run-as user) | API Enabled; read on Case, Opportunity, Account and User (Email); OAuth scope `api`. Pre-authorise the connected app for the integration user's profile/permission set | Salesforce admin: connected app, certificate, permission set |
+| HRMS (template) | Whatever the vendor offers; the template assumes OAuth client credentials | Read-only access to leave balances and work profiles only. Not compensation, bank or national-id data | HR data owner sign-off on which fields reach the model |
+
+### Assumptions (phase 2, not yet checked against real systems)
+
+- **Jira Cloud.** Search uses the enhanced JQL endpoint `GET /rest/api/3/search/jql`
+  with `nextPageToken` paging. The older `/rest/api/3/search` is being retired. JQL user
+  fields are assumed to accept the user's email; Atlassian only resolves an email the
+  integration account is allowed to see, otherwise use an accountId claim.
+- **Jira Data Center.** `GET /rest/api/2/search` with `startAt`/`maxResults`. JQL user
+  fields match usernames; an email works where it resolves to exactly one user.
+- **ServiceNow.** "My incidents" means `caller_id` = the user; "my requests" means
+  `requested_for` = the user (`sc_request`, not `sc_req_item`). Both are matched through the
+  referenced `sys_user` record's `email`. Number patterns assume the default `INC`/`REQ`
+  prefixes with 7+ digits.
+- **Salesforce.** `base_url` is the org's My Domain plus `/services/data/v62.0`; the token
+  response's `instance_url` is ignored. "Mine" means `OwnerId` is the User whose `Email`
+  equals the caller's. Queue-owned records are therefore not "mine". Case numbers are
+  assumed to be 5-10 digits (the default auto-number is 8).
+- **HRMS.** No vendor. The template's paths (`/employees/{id}/leave-balance`,
+  `/employees/{id}`) and field names are placeholders, to be replaced with the chosen
+  vendor's.
 
 ### Local demo (mock HR system + `hr_live_assistant`)
 
@@ -562,7 +645,8 @@ python scripts/mock_hr_api.py      # http://127.0.0.1:8099; reads HR_API_CLIENT_
 ```
 
 The example config sets `allow_private_network: true` because the mock runs on
-127.0.0.1. The mock knows `dev_user` and `dev_user_b` (by `preferred_username`).
+127.0.0.1. The mock knows `dev_user@example.com` and `dev_user_b@example.com` (the
+example config maps the verified `email` claim).
 `POST /__mock/faults {"delay_seconds": 10}` or `{"status": 503}` simulates failures, and
 `GET /__mock/requests` lists which employee ids were requested.
 

@@ -127,8 +127,10 @@ CHART_WITHOUT_CONTEXT_GUIDANCE = (
 CONNECTOR_TOOL_GUIDANCE = (
     "Some of your tools fetch live data from an external system. They only "
     "ever return data about the signed-in user; you cannot look up anyone "
-    "else, so if asked about another person, say that you can only show the "
-    "user's own data. If a live-data tool returns an error, say that the "
+    "else. If asked about another person, say that you can only show the "
+    "user's own data, and do not present any value as that other person's: "
+    "if you report a live value at all, say plainly that it is the signed-in "
+    "user's own. If a live-data tool returns an error, say that the "
     "system couldn't be reached and do not estimate, infer or guess the value "
     "(policy documents describe entitlements, not a person's current balance)."
 )

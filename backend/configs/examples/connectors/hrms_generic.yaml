@@ -1,0 +1,58 @@
+# Generic HRMS connector template (no vendor). Not loaded by itself: copy
+# this mapping into an assistant config's `connectors:` list, then replace
+# base_url, auth, the paths and the response field names with your HRMS's
+# API. Keep it read-only (GET only) and keep the identity parameters
+# server-injected.
+#
+# scripts/mock_hr_api.py serves both paths below, so the template can be
+# tried locally: base_url http://127.0.0.1:8099/api/v1 with
+# allow_private_network: true and the mock's HR_API_CLIENT_ID/SECRET.
+name: hrms
+type: rest
+display_name: HR system
+base_url: https://hrms.example.com/api/v1
+auth:
+  method: oauth_client_credentials
+  token_url: https://hrms.example.com/oauth/token
+  client_id: ${HRMS_CLIENT_ID}
+  client_secret: ${HRMS_CLIENT_SECRET}
+# email is a development default and must be email_verified. In production,
+# map an immutable employee-id claim from the IdP and set it here.
+identity:
+  claim: email
+operations:
+  - name: get_leave_balance
+    description: >-
+      Gets the signed-in employee's current leave balance (days available,
+      used and accrued, per leave type) live from the HR system. It always
+      returns the balance of the user who is asking.
+    method: GET
+    path: /employees/{employee_id}/leave-balance
+    parameters:
+      employee_id: {in: path, identity: true}
+      leave_type:
+        in: query
+        enum: [annual, sick, casual]
+        description: Optional, one leave type. Omit to get every type.
+    response:
+      fields: [as_of, balances]
+    timeout_seconds: 5
+    max_response_bytes: 16000
+    required_labels: ["role:employee"]
+
+  - name: get_employee_profile
+    description: >-
+      Gets the signed-in employee's own work profile from the HR system: job
+      title, department, location, manager and start date.
+    method: GET
+    path: /employees/{employee_id}
+    parameters:
+      employee_id: {in: path, identity: true}
+    # Data minimisation: only work-profile fields reach the model. Never add
+    # salary, bank, national id, home address or date-of-birth fields here.
+    response:
+      fields: [display_name, job_title, department, location, manager.display_name,
+               manager.email, start_date, employment_type]
+    timeout_seconds: 5
+    max_response_bytes: 16000
+    required_labels: ["role:employee"]

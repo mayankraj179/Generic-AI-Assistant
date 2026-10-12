@@ -205,11 +205,19 @@ class OperationRef(_Strict):
         return check_labels(v, field="required_labels", required=True)
 
 
+DEFAULT_IDENTITY_CLAIM = "email"
+
+
 class ConnectorIdentityConfig(_Strict):
     """Which validated JWT claim holds the user's id in the external system.
-    Its value is injected into identity parameters server-side."""
+    Its value is injected into identity parameters server-side.
 
-    claim: str = Field(min_length=1)
+    Defaults to ``email``, a development default: production should map an
+    immutable employee-id claim from the IdP (emails get reassigned and
+    renamed). When the claim used is ``email``, the token must also carry
+    ``email_verified: true`` or nothing is injected (see runtime.py)."""
+
+    claim: str = Field(default=DEFAULT_IDENTITY_CLAIM, min_length=1)
 
 
 class ConnectorConfig(_Strict):
@@ -220,7 +228,7 @@ class ConnectorConfig(_Strict):
     base_url: str
     allow_private_network: bool = False
     auth: ConnectorAuthConfig
-    identity: ConnectorIdentityConfig | None = None
+    identity: ConnectorIdentityConfig = Field(default_factory=ConnectorIdentityConfig)
     # type: rest -> full OperationSpec entries; a preset -> OperationRef entries.
     operations: list[OperationSpec | OperationRef] = Field(min_length=1)
 
@@ -315,12 +323,6 @@ class ConnectorConfig(_Strict):
                 raise ValueError(
                     f"connector '{self.name}' operation '{op.name}': the combined tool "
                     f"name is longer than {MAX_TOOL_NAME_LENGTH} characters"
-                )
-            needs_claim = [n for n, p in op.identity_params().items() if p.claim is None]
-            if needs_claim and self.identity is None:
-                raise ValueError(
-                    f"connector '{self.name}' operation '{op.name}' needs the caller's "
-                    "identity; set identity.claim to the JWT claim holding their id"
                 )
         return self
 

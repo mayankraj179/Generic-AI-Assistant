@@ -1,0 +1,106 @@
+# Salesforce REST API, reviewed and parameterised SOQL only: every query is a
+# fixed SELECT template, scoped to records the signed-in user owns, sent to
+# GET /query and paged with nextRecordsUrl. The model never writes SOQL; it
+# only fills typed values, escaped as SOQL string literals.
+#
+# base_url: https://<MyDomain>.my.salesforce.com/services/data/v62.0
+#   (the API version is part of base_url; the token response's instance_url
+#   is not used, so base_url must be the org's My Domain URL)
+# auth: oauth_jwt_bearer (connected app with a certificate; audience
+#       https://login.salesforce.com, or https://test.salesforce.com for a
+#       sandbox; subject = the integration user's username) or
+#       oauth_client_credentials (connected app with the client credentials
+#       flow enabled and a run-as user; client_auth: post).
+# identity: matched to the Salesforce User whose Email equals the caller's
+#       verified email (a semi-join on User, so queue-owned records simply
+#       don't match). Map a FederationIdentifier claim instead for production.
+type: salesforce
+description: Salesforce (REST API, SOQL query endpoint), read-only cases and opportunities owned by the signed-in user.
+auth_methods: [oauth_jwt_bearer, oauth_client_credentials]
+operations:
+  - name: my_open_cases
+    description: >-
+      Lists open Salesforce cases owned by the signed-in user, most recently
+      modified first. Optional filter: priority.
+    method: GET
+    path: /query
+    parameters:
+      user: {in: template, identity: true}
+      priority:
+        in: template
+        enum: [High, Medium, Low]
+        description: Optional, one priority.
+    templates:
+      q:
+        language: soql
+        parts:
+          - "SELECT CaseNumber, Subject, Status, Priority, Origin, LastModifiedDate FROM Case"
+          - "WHERE IsClosed = false AND OwnerId IN (SELECT Id FROM User WHERE Email = {user})"
+          - "AND Priority = {priority}"
+          - "ORDER BY LastModifiedDate DESC LIMIT 50"
+    response:
+      root: records
+      fields: [CaseNumber, Subject, Status, Priority, Origin, LastModifiedDate]
+      max_items: 25
+    pagination:
+      strategy: next_link
+      next_link_path: nextRecordsUrl
+      max_pages: 2
+    timeout_seconds: 10
+
+  - name: get_case
+    description: >-
+      Gets one Salesforce case by its case number (for example 00001026),
+      only if the signed-in user owns it.
+    method: GET
+    path: /query
+    parameters:
+      user: {in: template, identity: true}
+      case_number:
+        in: template
+        pattern: "^[0-9]{5,10}$"
+        description: The case number, e.g. 00001026.
+    required: [case_number]
+    templates:
+      q:
+        language: soql
+        parts:
+          - "SELECT CaseNumber, Subject, Description, Status, Priority, Origin, CreatedDate, LastModifiedDate FROM Case"
+          - "WHERE CaseNumber = {case_number} AND OwnerId IN (SELECT Id FROM User WHERE Email = {user})"
+          - "LIMIT 1"
+    response:
+      root: records
+      fields: [CaseNumber, Subject, Description, Status, Priority, Origin, CreatedDate,
+               LastModifiedDate]
+      max_items: 1
+    timeout_seconds: 10
+
+  - name: my_open_opportunities
+    description: >-
+      Lists open Salesforce opportunities owned by the signed-in user, by
+      close date. Optional filter: stage name.
+    method: GET
+    path: /query
+    parameters:
+      user: {in: template, identity: true}
+      stage:
+        in: template
+        max_length: 80
+        description: Optional, an opportunity stage name, e.g. Negotiation/Review.
+    templates:
+      q:
+        language: soql
+        parts:
+          - "SELECT Name, StageName, Amount, CloseDate, Probability, Account.Name FROM Opportunity"
+          - "WHERE IsClosed = false AND OwnerId IN (SELECT Id FROM User WHERE Email = {user})"
+          - "AND StageName = {stage}"
+          - "ORDER BY CloseDate ASC LIMIT 50"
+    response:
+      root: records
+      fields: [Name, StageName, Amount, CloseDate, Probability, Account.Name]
+      max_items: 25
+    pagination:
+      strategy: next_link
+      next_link_path: nextRecordsUrl
+      max_pages: 2
+    timeout_seconds: 10

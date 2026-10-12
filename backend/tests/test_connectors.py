@@ -239,9 +239,14 @@ def test_operation_needs_required_labels():
         ConnectorConfig.model_validate(_connector(operations=ops))
 
 
-def test_identity_operation_requires_identity_claim():
-    with pytest.raises(ValidationError, match="identity.claim"):
-        ConnectorConfig.model_validate(_connector(identity=None))
+def test_identity_claim_defaults_to_email_and_is_configurable():
+    data = _connector()
+    del data["identity"]
+    assert ConnectorConfig.model_validate(data).identity.claim == "email"
+    custom = _connector(identity={"claim": "employee_id"})
+    assert ConnectorConfig.model_validate(custom).identity.claim == "employee_id"
+    with pytest.raises(ValidationError):
+        ConnectorConfig.model_validate(_connector(identity={"claim": ""}))
 
 
 def test_on_behalf_of_is_reserved_but_not_implemented():
@@ -869,3 +874,69 @@ async def test_each_call_gets_a_span_without_values_or_identity():
             assert value not in dumped
     assert spans[0].attributes["connector.pages"] == 1
     assert spans[1].status.status_code.name == "ERROR"
+
+
+def _email_principal(**claims) -> PrincipalContext:
+    return PrincipalContext(
+        tenant_id="t1", principal_id="sub-a", labels=LABELS, clearance=1, claims=claims
+    )
+
+
+@pytest.mark.parametrize(
+    ("claims", "kind"),
+    [
+        ({"email": "user_a", "email_verified": "false"}, "identity_unverified"),
+        ({"email": "user_a"}, "identity_unverified"),
+        ({"email_verified": "true"}, "identity_unavailable"),
+        ({"email": "", "email_verified": "true"}, "identity_unavailable"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_email_identity_refused_unless_present_and_verified(claims, kind):
+    hr = MockHR()
+    data = _connector()
+    del data["identity"]  # default claim: email
+    config = ConnectorConfig.model_validate(data)
+    bind_turn(
+        TurnConnectors(
+            _email_principal(**claims), [config], transport=hr.transport, resolver=public_dns
+        )
+    )
+    result = await execute_tool(TOOL, {})
+    assert result["error_kind"] == kind
+    assert hr.requested == [] and hr.token_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_verified_email_identity_is_injected():
+    hr = MockHR()
+    data = _connector()
+    del data["identity"]
+    bind_turn(
+        TurnConnectors(
+            _email_principal(email="user_a", email_verified="true"),
+            [ConnectorConfig.model_validate(data)],
+            transport=hr.transport,
+            resolver=public_dns,
+        )
+    )
+    assert "data" in await execute_tool(TOOL, {})
+    assert hr.requested == ["user_a"]
+
+
+def test_jwt_boolean_claims_become_strings():
+    from app.auth.models import AuthenticatedIdentity
+
+    identity = AuthenticatedIdentity.from_claims(
+        {
+            "sub": "s",
+            "iss": "i",
+            "aud": "a",
+            "email": "a@x.test",
+            "email_verified": True,
+            "realm_access": {"roles": ["r"]},
+        }
+    )
+    assert identity.identity_claims["email_verified"] == "true"
+    assert identity.identity_claims["email"] == "a@x.test"
+    assert "realm_access" not in identity.identity_claims

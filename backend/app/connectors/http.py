@@ -203,6 +203,10 @@ async def send(
                     raise ConnectorCallError("auth_failed", f"http {status}")
                 elif status == 404:
                     raise ConnectorCallError("not_found", "http 404")
+                elif status in (400, 422):
+                    # The system understood the request and refused it (e.g.
+                    # JQL naming an issue that doesn't exist): not "unreachable".
+                    raise ConnectorCallError("rejected", f"http {status}")
                 elif not 200 <= status < 300:
                     raise ConnectorCallError("unavailable", f"http {status}")
                 else:

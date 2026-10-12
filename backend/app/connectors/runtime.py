@@ -53,6 +53,7 @@ from app.connectors.http import (
     within_base,
 )
 from app.connectors.spec import OperationSpec, tool_name
+from app.connectors.templates import render as render_template
 from app.core.principal import PrincipalContext
 from app.core.tool_definition import ToolDefinition, ToolKind
 from app.observability.audit import record_connector_call, record_guardrail
@@ -76,9 +77,15 @@ _FAILURE_MESSAGES = {
     "bad_response": "{source} returned a response that could not be read.",
     "response_too_large": "{source} returned more data than allowed, so it was discarded.",
     "not_found": "{source} has no matching record for the signed-in user.",
+    "rejected": "{source} rejected the lookup (for example, the record does not exist or a "
+    "value is not valid there).",
     "denied": "The signed-in user is not permitted to use this {source} lookup.",
     "identity_unavailable": (
         "The signed-in user's {source} id is not available, so their data cannot be looked up."
+    ),
+    "identity_unverified": (
+        "The signed-in user's email address is not verified, so their {source} data cannot be "
+        "looked up."
     ),
     "invalid_arguments": "The arguments were not valid for this lookup: {detail}",
     "unknown_tool": "This lookup is not available.",
@@ -404,11 +411,7 @@ class TurnConnectors:
             raise ConnectorCallError("invalid_arguments", errors[0].message[:200])
 
         for pname, param in identity_params.items():
-            claim = param.claim or (connector.identity.claim if connector.identity else None)
-            value = self._principal.claims.get(claim) if claim else None
-            if not value:
-                raise ConnectorCallError("identity_unavailable", "identity claim missing")
-            values[pname] = value
+            values[pname] = self._identity_value(param.claim or connector.identity.claim)
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + spec.timeout_seconds
@@ -417,6 +420,17 @@ class TurnConnectors:
                 return await self._fetch(bound, values, deadline)
         except TimeoutError as exc:
             raise ConnectorCallError("timeout", "timed out") from exc
+
+    def _identity_value(self, claim: str) -> str:
+        """The caller's id from a validated claim. Fails closed: a missing or
+        empty claim, or an email claim the IdP hasn't marked verified, means
+        no call (an unverified email could be anyone's address)."""
+        value = self._principal.claims.get(claim)
+        if not value:
+            raise ConnectorCallError("identity_unavailable", "identity claim missing")
+        if claim == "email" and self._principal.claims.get("email_verified") != "true":
+            raise ConnectorCallError("identity_unverified", "email not verified")
+        return value
 
     def _first_request(self, bound: _BoundOperation, values: dict[str, Any]) -> Request:
         connector, spec = bound.connector, bound.spec
@@ -431,8 +445,15 @@ class TurnConnectors:
                 path = path.replace("{" + pname + "}", quote(str(value), safe=""))
             elif param.location == "query":
                 query[pname] = _query_value(value)
-            else:
+            elif param.location == "body":
                 body[pname] = value
+        for tname, template in spec.templates.items():
+            # Template parameters reach the request only here, escaped.
+            text = render_template(template, values)
+            if template.location == "query":
+                query[tname] = text
+            else:
+                body[tname] = text
         pagination = spec.pagination
         if pagination.page_size_param:
             target = body if spec.method == "POST" else query

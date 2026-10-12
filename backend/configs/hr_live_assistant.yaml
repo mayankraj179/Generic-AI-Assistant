@@ -49,10 +49,11 @@ connectors:
       client_id: ${HR_API_CLIENT_ID}
       client_secret: ${HR_API_CLIENT_SECRET}
     # The validated JWT claim holding the user's id in the HR system. It is
-    # injected server-side; the model can't see or change it. (In production
-    # this would typically be an employee_id claim from an IdP mapper.)
+    # injected server-side; the model can't see or change it. email is a dev
+    # default (and must be email_verified); production should use an
+    # immutable employee-id claim from the IdP.
     identity:
-      claim: preferred_username
+      claim: email
     operations:
       - name: get_leave_balance
         # Every authenticated dev user holds these today (see README); a real
