@@ -1,0 +1,107 @@
+# SAP SuccessFactors (Employee Central / Time Off), read-only OData v2: the
+# signed-in user's profile and manager, their direct reports, and their time
+# off requests. Generic on purpose: it has not been run against a real tenant
+# yet. See the README "SAP" section for every assumption.
+#
+# base_url: https://<api-server>/odata/v2   (e.g. https://api4.successfactors.com/odata/v2;
+#   the API server depends on the data centre)
+# auth: basic (an API user, written username@companyId) or bearer (an access
+#   token obtained outside this framework). SuccessFactors' OAuth is the SAML
+#   2.0 bearer grant, which this framework does not build yet; SAP is
+#   retiring Basic auth for the API, so check your tenant's policy.
+# identity: users are matched on their email (User.email, and
+#   userIdNav/email for time off). That is the email default; production
+#   should match on userId with a claim holding it.
+type: sap_successfactors
+description: SAP SuccessFactors OData v2 (read-only) - own profile, manager, direct reports and time off requests.
+auth_methods: [basic, bearer]
+operations:
+  - name: my_profile
+    description: >-
+      Gets the signed-in user's own employee profile from SuccessFactors:
+      name, title, department, division, location, hire date and manager.
+    method: GET
+    path: /User
+    parameters:
+      user: {in: template, identity: true}
+    templates:
+      $filter:
+        language: odata
+        parts:
+          - "email eq {user}"
+    fixed_query:
+      $select: userId,defaultFullName,title,department,division,location,hireDate,email,manager/defaultFullName,manager/email,manager/title
+      $expand: manager
+      $format: json
+    response:
+      root: d.results
+      fields: [userId, defaultFullName, title, department, division, location, hireDate, email,
+               manager.defaultFullName, manager.email, manager.title]
+      max_items: 1
+    timeout_seconds: 15
+    max_response_bytes: 64000
+
+  - name: my_direct_reports
+    description: >-
+      Lists the employees who report directly to the signed-in user: name,
+      title, department and email.
+    method: GET
+    path: /User
+    parameters:
+      user: {in: template, identity: true}
+    templates:
+      $filter:
+        language: odata
+        parts:
+          - "manager/email eq {user}"
+    fixed_query:
+      $select: defaultFullName,title,department,email
+      $orderby: defaultFullName
+      $format: json
+    response:
+      root: d.results
+      fields: [defaultFullName, title, department, email]
+      max_items: 50
+    pagination:
+      strategy: offset
+      offset_param: $skip
+      page_size: 25
+      page_size_param: $top
+      max_pages: 2
+    timeout_seconds: 15
+    max_response_bytes: 200000
+
+  - name: my_time_off_requests
+    description: >-
+      Lists the signed-in user's time off requests (type, dates, days,
+      approval status), latest first. Optional filter: approval status.
+    method: GET
+    path: /EmployeeTime
+    parameters:
+      user: {in: template, identity: true}
+      approval_status:
+        in: template
+        enum: [PENDING, APPROVED, REJECTED, CANCELLED]
+        description: Optional, one approval status.
+    templates:
+      $filter:
+        language: odata
+        parts:
+          - "userIdNav/email eq {user}"
+          - "and approvalStatus eq {approval_status}"
+    fixed_query:
+      $select: externalCode,timeType,startDate,endDate,quantityInDays,approvalStatus
+      $orderby: startDate desc
+      $format: json
+    response:
+      root: d.results
+      fields: [externalCode, timeType, startDate, endDate, quantityInDays, approvalStatus]
+      max_items: 50
+    pagination:
+      strategy: offset
+      offset_param: $skip
+      page_size: 25
+      page_size_param: $top
+      max_pages: 2
+    timeout_seconds: 15
+    max_response_bytes: 200000

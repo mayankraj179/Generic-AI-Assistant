@@ -1,0 +1,152 @@
+# SAP S/4HANA, read-only OData v2 (SAP Gateway) APIs from the SAP Business
+# Accelerator Hub: purchase orders and purchase requisitions the signed-in
+# user created, and business partner master data. Generic on purpose: it has
+# not been run against a real system yet. See the README "SAP" section for
+# every assumption.
+#
+# base_url: https://<host>:<port>/sap/opu/odata/sap   (on-prem / private cloud)
+#           https://<tenant>-api.s4hana.cloud.sap/sap/opu/odata/sap   (Cloud)
+# On-prem: set allow_private_network: true, and tls_ca_bundle for a
+#   corporate CA. Plain http is only allowed with allow_private_network.
+# auth: basic (a technical/communication user with read-only roles) or
+#   oauth_client_credentials (e.g. SAP BTP / XSUAA, or an S/4HANA Cloud
+#   communication arrangement that offers it). SAML bearer is not built.
+# identity: documents record the SAP user name (CreatedByUser), so
+#   identity.claim must name a claim holding it (e.g. an IdP mapper
+#   "sap_user"); config loading fails if it is left at the email default.
+# settings: sap_client (the client number, e.g. "100"; sent as sap-client).
+type: sap_s4hana
+description: SAP S/4HANA OData v2 (read-only) - purchase orders and requisitions the signed-in user created, and business partners.
+auth_methods: [basic, oauth_client_credentials]
+requires_identity_claim: true
+operations:
+  - name: my_purchase_orders
+    description: >-
+      Lists purchase orders the signed-in user created in SAP, newest first.
+      Optional filter: supplier number.
+    method: GET
+    path: /API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+    parameters:
+      sap-client: {in: query, setting: sap_client}
+      user: {in: template, identity: true}
+      supplier:
+        in: template
+        pattern: "^[0-9A-Z]{1,10}$"
+        description: Optional, a supplier (vendor) number.
+    templates:
+      $filter:
+        language: odata
+        parts:
+          - "CreatedByUser eq {user}"
+          - "and Supplier eq {supplier}"
+    fixed_query:
+      $select: PurchaseOrder,PurchaseOrderType,Supplier,CompanyCode,PurchasingOrganization,CreationDate,DocumentCurrency,PurchasingProcessingStatus
+      $orderby: CreationDate desc
+      $format: json
+    response:
+      root: d.results
+      fields: [PurchaseOrder, PurchaseOrderType, Supplier, CompanyCode, PurchasingOrganization,
+               CreationDate, DocumentCurrency, PurchasingProcessingStatus]
+      max_items: 50
+    pagination:
+      strategy: offset
+      offset_param: $skip
+      page_size: 25
+      page_size_param: $top
+      max_pages: 2
+    timeout_seconds: 15
+    max_response_bytes: 500000
+
+  - name: get_purchase_order
+    description: >-
+      Gets one purchase order (header and items) by its 10-digit number,
+      only if the signed-in user created it.
+    method: GET
+    path: /API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+    parameters:
+      sap-client: {in: query, setting: sap_client}
+      user: {in: template, identity: true}
+      purchase_order:
+        in: template
+        pattern: "^[0-9]{10}$"
+        description: The purchase order number, e.g. 4500000123.
+    required: [purchase_order]
+    templates:
+      $filter:
+        language: odata
+        parts:
+          - "PurchaseOrder eq {purchase_order} and CreatedByUser eq {user}"
+    fixed_query:
+      $select: PurchaseOrder,Supplier,CompanyCode,CreationDate,DocumentCurrency,PurchasingProcessingStatus,to_PurchaseOrderItem/PurchaseOrderItem,to_PurchaseOrderItem/Material,to_PurchaseOrderItem/PurchaseOrderItemText,to_PurchaseOrderItem/OrderQuantity,to_PurchaseOrderItem/PurchaseOrderQuantityUnit,to_PurchaseOrderItem/NetPriceAmount
+      $expand: to_PurchaseOrderItem
+      $format: json
+    response:
+      root: d.results
+      fields: [PurchaseOrder, Supplier, CompanyCode, CreationDate, DocumentCurrency,
+               PurchasingProcessingStatus, to_PurchaseOrderItem.results]
+      max_items: 1
+    timeout_seconds: 15
+    max_response_bytes: 500000
+
+  - name: my_purchase_requisitions
+    description: >-
+      Lists purchase requisition items the signed-in user created in SAP,
+      newest first.
+    method: GET
+    path: /API_PURCHASEREQ_PROCESS_SRV/A_PurchaseRequisitionItem
+    parameters:
+      sap-client: {in: query, setting: sap_client}
+      user: {in: template, identity: true}
+    templates:
+      $filter:
+        language: odata
+        parts:
+          - "CreatedByUser eq {user}"
+    fixed_query:
+      $select: PurchaseRequisition,PurchaseRequisitionItem,PurchaseRequisitionItemText,Material,RequestedQuantity,BaseUnit,PurchaseRequisitionPrice,PurReqnPriceQuantity,CreationDate,ProcessingStatus
+      $orderby: CreationDate desc
+      $format: json
+    response:
+      root: d.results
+      fields: [PurchaseRequisition, PurchaseRequisitionItem, PurchaseRequisitionItemText,
+               Material, RequestedQuantity, BaseUnit, PurchaseRequisitionPrice, CreationDate,
+               ProcessingStatus]
+      max_items: 50
+    pagination:
+      strategy: offset
+      offset_param: $skip
+      page_size: 25
+      page_size_param: $top
+      max_pages: 2
+    timeout_seconds: 15
+    max_response_bytes: 500000
+
+  - name: get_business_partner
+    description: >-
+      Gets basic master data for one business partner (customer or
+      supplier) by number: name, category and grouping. Shared reference
+      data, the same for everyone allowed to use it.
+    method: GET
+    path: /API_BUSINESS_PARTNER/A_BusinessPartner
+    parameters:
+      sap-client: {in: query, setting: sap_client}
+      business_partner:
+        in: template
+        pattern: "^[0-9A-Z]{1,10}$"
+        description: The business partner number.
+    required: [business_partner]
+    templates:
+      $filter:
+        language: odata
+        parts:
+          - "BusinessPartner eq {business_partner}"
+    fixed_query:
+      $select: BusinessPartner,BusinessPartnerFullName,BusinessPartnerCategory,BusinessPartnerGrouping,CreationDate
+      $format: json
+    response:
+      root: d.results
+      fields: [BusinessPartner, BusinessPartnerFullName, BusinessPartnerCategory,
+               BusinessPartnerGrouping, CreationDate]
+      max_items: 1
+    timeout_seconds: 15
+    max_response_bytes: 64000

@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import re
+import ssl
 import time
 import weakref
 from collections.abc import AsyncIterator, Sequence
@@ -35,6 +36,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urljoin
 
@@ -533,7 +535,7 @@ class TurnConnectors:
         max_items = spec.response.max_items
         request: Request | None = self._first_request(bound, values)
 
-        async with self._client() as client:
+        async with self._client(connector) as client:
             auth_context = AuthContext(client=client, principal=self._principal, guard=guard.check)
             items: list[Any] = []
             pages = offset = 0
@@ -582,28 +584,46 @@ class TurnConnectors:
         }, pages
 
     @asynccontextmanager
-    async def _client(self) -> AsyncIterator[httpx.AsyncClient]:
+    async def _client(self, connector: ConnectorConfig) -> AsyncIterator[httpx.AsyncClient]:
         if self._transport is not None:
             async with httpx.AsyncClient(transport=self._transport, follow_redirects=False) as c:
                 yield c
         else:
-            yield _shared_client()
+            yield _shared_client(connector.tls_ca_bundle)
 
 
 # One pooled client per event loop for real HTTP: building an AsyncClient
 # loads a TLS context, which measured ~1s on a Windows dev machine, longer
 # than the call itself. Per-request timeouts come from each operation.
 # Redirects are never followed by httpx itself (see http.send).
-_shared_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = (
-    weakref.WeakKeyDictionary()
-)
+# A connector with tls_ca_bundle gets its own pooled client per bundle.
+_shared_clients: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str | None, httpx.AsyncClient]
+] = weakref.WeakKeyDictionary()
 
 
-def _shared_client() -> httpx.AsyncClient:
+def tls_context(ca_bundle: str) -> ssl.SSLContext:
+    """The default (verifying) context plus the bundle's CAs."""
+    path = Path(ca_bundle)
+    if not path.is_file():
+        raise ConnectorCallError("not_configured", "the connector's CA bundle file is missing")
+    context = ssl.create_default_context()
+    try:
+        context.load_verify_locations(cafile=str(path))
+    except (ssl.SSLError, OSError) as exc:
+        raise ConnectorCallError("not_configured", "the connector's CA bundle is invalid") from exc
+    return context
+
+
+def _shared_client(ca_bundle: str | None = None) -> httpx.AsyncClient:
     loop = asyncio.get_running_loop()
-    client = _shared_clients.get(loop)
+    clients = _shared_clients.setdefault(loop, {})
+    client = clients.get(ca_bundle)
     if client is None or client.is_closed:
-        client = _shared_clients[loop] = httpx.AsyncClient(follow_redirects=False, timeout=30.0)
+        verify: ssl.SSLContext | bool = tls_context(ca_bundle) if ca_bundle else True
+        client = clients[ca_bundle] = httpx.AsyncClient(
+            follow_redirects=False, timeout=30.0, verify=verify
+        )
     return client
 
 

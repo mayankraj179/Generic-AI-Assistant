@@ -427,7 +427,8 @@ ingested documents. Connectors are **read-only**, so there is no confirmation ga
 | Any HRMS | template `configs/examples/connectors/hrms_generic.yaml` (`type: rest`) | built, mock-tested | The HRMS vendor; then its real paths and field names |
 | Microsoft Graph (profile, manager, OneDrive metadata) | preset `microsoft_graph` | built, mock-tested | An Entra app registration with admin consent; confirm the identity claim resolves in `/users/{id}` |
 | SharePoint (list items, library item metadata) | preset `microsoft_graph` | built, mock-tested | A site, list and library to point at, and a `Sites.Selected` grant on that site |
-| SAP (OData) | presets | not built yet (phase 4) | |
+| SAP S/4HANA (OData v2) | preset `sap_s4hana` | built, mock-tested | A system (on-prem or Cloud), a read-only technical user or OAuth client, the `sap-client`, and an IdP claim with the SAP user name |
+| SAP SuccessFactors (OData v2) | preset `sap_successfactors` | built, mock-tested | A tenant and API user (Basic) or an externally issued token; OAuth (SAML bearer) not built |
 
 "Live-verified" is used only after a real call to the real system. No system has been
 live-verified yet.
@@ -535,7 +536,9 @@ for someone else's record therefore returns nothing, rather than the record.
   loading. Rejected values are never echoed in the error.
 - **Network.** `base_url` and `token_url` must be `https` and must not be private or local
   addresses, unless the connector sets `allow_private_network: true` (meant for on-prem
-  systems such as SAP).
+  systems such as SAP). For a corporate CA, set `tls_ca_bundle` to a PEM file. Its CAs are
+  trusted *in addition to* the defaults, and certificate verification is never switched
+  off.
 - **Unknown things fail.** An unknown connector type, preset operation or auth method,
   duplicate names, missing `required_labels` and pagination without `response.root` all
   fail loading.
@@ -687,6 +690,67 @@ Assumptions (not yet checked against a real tenant):
 - List rows are returned with `expand=fields`. The owner column is a single-line text
   column holding an email, not a Person column (those return lookup ids).
 - Graph accepts site and drive ids literally in the path (`,` and `!` unencoded).
+
+### SAP (`sap_s4hana`, `sap_successfactors`)
+
+Both presets are **generic and unverified**: no real SAP system was available. Every
+assumption is listed below so it can be checked against the real system first.
+
+```yaml
+connectors:
+  - name: s4
+    type: sap_s4hana
+    display_name: SAP
+    base_url: https://s4h.corp.internal:44300/sap/opu/odata/sap
+    allow_private_network: true          # on-prem
+    tls_ca_bundle: certs/corp-root-ca.pem
+    auth: {method: basic, username: ${SAP_USER}, password: ${SAP_PASSWORD}}
+    identity: {claim: sap_user}          # required: documents store the SAP user name
+    settings: {sap_client: "100"}        # sent as sap-client
+    operations:
+      - {name: my_purchase_orders, required_labels: ["role:buyer"]}
+```
+
+| Preset | Operation | Reads (OData v2) | Scoped by |
+|---|---|---|---|
+| `sap_s4hana` | `my_purchase_orders` | `API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder`, optional supplier filter | `CreatedByUser eq <caller>` |
+| | `get_purchase_order` | one PO with items (`$expand=to_PurchaseOrderItem`), 10-digit number | number AND `CreatedByUser` |
+| | `my_purchase_requisitions` | `API_PURCHASEREQ_PROCESS_SRV/A_PurchaseRequisitionItem` | `CreatedByUser eq <caller>` |
+| | `get_business_partner` | `API_BUSINESS_PARTNER/A_BusinessPartner`: name, category, grouping | shared master data: labels only |
+| `sap_successfactors` | `my_profile` | `User`: name, title, department, division, location, hire date, manager | `email eq <caller>` |
+| | `my_direct_reports` | `User` rows whose manager is the caller | `manager/email eq <caller>` |
+| | `my_time_off_requests` | `EmployeeTime`: type, dates, days, approval status | `userIdNav/email eq <caller>` |
+
+All filters are OData templates with `'`-doubling, and numbers are pattern-checked, so the
+model can't widen a `$filter`. Responses use `$select` and a field projection: no bank
+details, salary or other fields not listed. Paging uses `$skip`/`$top` (25 per page, up to
+50 rows), and OData v2 dates arrive in SAP's `/Date(ms)/` form.
+
+**S/4HANA vs SuccessFactors: what differs, and what's assumed**
+
+| | S/4HANA | SuccessFactors |
+|---|---|---|
+| Where it runs | On-prem or private cloud (needs `allow_private_network`, often `tls_ca_bundle`), or S/4HANA Cloud (public) | SAP-hosted cloud only (https, public) |
+| Base URL | `…/sap/opu/odata/sap` + one service per API (SAP Gateway) | `https://<api-server>/odata/v2` (API server by data centre) |
+| OData | v2 classic APIs (`d.results`). Newer v4 APIs (`/sap/opu/odata4/…`, `@odata.nextLink`) need a `type: rest` connector | v2 (`d.results`) |
+| Auth this framework supports | `basic` (technical or communication user), `oauth_client_credentials` (e.g. SAP BTP XSUAA, or a communication arrangement that offers it) | `basic` (API user as `username@companyId`), `bearer` (token obtained elsewhere) |
+| Not built | OAuth SAML bearer, X.509 client certificates, principal propagation (on-behalf-of) | OAuth 2.0 SAML bearer grant: SuccessFactors' standard OAuth. SAP is retiring Basic auth for the API, so this is the main gap |
+| User identity | SAP user name (`CreatedByUser`). **`identity.claim` must be set**; loading fails at the email default | Email via `User.email` / `userIdNav/email` (the dev default). Production should match on `userId` with a claim holding it |
+| Client | `sap-client` sent from `settings.sap_client` | none |
+| Roles the technical user needs | Read authorisations for the APIs used (e.g. purchasing display), activated OData services (`/IWFND/MAINT_SERVICE`) or a communication scenario in Cloud | API permissions for User, Employee Central and Time Off entities (role-based permissions on an API user) |
+| Approvals | SAP Basis/security for the technical user, service activation and network path (VPN/Cloud Connector) | SuccessFactors admin for the API user or OAuth client, and HR data owner for the fields exposed |
+
+Further assumptions:
+- The S/4HANA field names (`CreatedByUser`, `PurchasingProcessingStatus`,
+  `ProcessingStatus`, `PurReqnPriceQuantity`) follow SAP Business Accelerator Hub
+  documentation for these APIs and may differ by release.
+- "Mine" in S/4HANA means created by the user, not "I'm the requester" or "I approve
+  it".
+- SuccessFactors allows filtering `User` by `email` and `manager/email`, and `EmployeeTime`
+  by `userIdNav/email`. If a tenant disallows navigation filters, write a `type: rest`
+  connector that filters `userId eq` with a userId claim.
+- Reads need no CSRF token (SAP Gateway only asks for one on modifying requests, which
+  connectors never send).
 
 ### Identity claim: `email` is a development default
 

@@ -229,6 +229,11 @@ class ConnectorConfig(_Strict):
     display_name: str = Field(min_length=1)
     base_url: str
     allow_private_network: bool = False
+    # A PEM file of extra CA certificates to trust for this connector (an
+    # on-prem system with a corporate CA). Verification is never turned off.
+    # Relative paths resolve against the backend directory; a missing file
+    # fails the call (not_configured), not config loading.
+    tls_ca_bundle: str | None = Field(default=None, min_length=1)
     auth: ConnectorAuthConfig
     identity: ConnectorIdentityConfig = Field(default_factory=ConnectorIdentityConfig)
     # Admin-fixed values some operations need (e.g. a SharePoint site_id or
@@ -305,6 +310,11 @@ class ConnectorConfig(_Strict):
                 known = ", ".join(sorted([REST_TYPE, *CONNECTOR_PRESETS]))
                 raise ValueError(
                     f"connector '{self.name}' has unknown type '{self.type}' (known types: {known})"
+                )
+            if preset.requires_identity_claim and "identity" not in self.model_fields_set:
+                raise ValueError(
+                    f"connector '{self.name}': type '{self.type}' identifies users by a system "
+                    "user id, not email; set identity.claim to the JWT claim that holds it"
                 )
             if self.auth.method not in preset.auth_methods:
                 raise ValueError(

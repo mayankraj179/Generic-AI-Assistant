@@ -415,6 +415,10 @@ class PresetSpec(_Strict):
     type: str
     description: str
     auth_methods: list[str] = Field(min_length=1)
+    # True when the system keys users by something the email default can't
+    # match (e.g. an SAP user name): the config must set identity.claim, or
+    # loading fails instead of every lookup silently finding nothing.
+    requires_identity_claim: bool = False
     operations: list[OperationSpec] = Field(min_length=1)
 
     @field_validator("type")
