@@ -1,5 +1,4 @@
-// Chart rendering for assistant replies — the same component the embeddable
-// widget uses (frontend/src/AssistantWidgetApp.tsx), copied so ui/ stands alone.
+// Chart rendering for assistant replies.
 import {
   Bar,
   BarChart,

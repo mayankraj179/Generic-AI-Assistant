@@ -1,8 +1,8 @@
 # Generic AI Assistant Framework
 
 Backend: Python 3.12 + FastAPI + Pydantic v2. Application UI: `ui/` (React + Vite,
-Keycloak sign-in via Authorization Code + PKCE). Embeddable widget: `frontend/` (React +
-Vite Shadow DOM custom element). DB: Postgres + pgvector, via Alembic migrations.
+Keycloak sign-in via Authorization Code + PKCE; `npm run build:embed` also builds an
+embeddable chat launcher for other pages). DB: Postgres + pgvector, via Alembic migrations.
 
 ## Running the whole stack (local development)
 
@@ -906,15 +906,11 @@ only authored.
 
 `ui/` is the application to run — see "Running the whole stack" above and `ui/README.md`.
 
-## Embeddable widget (`frontend/`)
+## Embedding the assistant on another page
 
-`frontend/` builds the `<assistant-widget>` custom element (`src/widget.tsx`,
-`src/AssistantWidgetApp.tsx`, `src/api.ts`) as a library (`npm run build` → `dist/`) for
-embedding in other host pages. It has no sign-in of its own: the host page supplies an
-access token through the `auth-token` attribute. It is not needed to run the application.
-
-For widget development only, `npm run dev` in `frontend/` serves a harness on
-http://localhost:5173 (`chat.html`: paste a dev token obtained with the curl command above).
+`ui/` also builds a self-contained chat launcher for other pages (`npm run build:embed` →
+`ui/dist-embed/bitwise-assist.js`, Shadow DOM, same Keycloak PKCE sign-in). Demo host page:
+`ui/portal-demo.html`. See "Embedding on another page (chat launcher)" in `ui/README.md`.
 
 ## Known environment issue
 

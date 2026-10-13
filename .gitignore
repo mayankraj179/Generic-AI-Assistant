@@ -15,8 +15,6 @@ backend/*.log
 backend/scratch_*.py
 
 # Node / frontend
-frontend/node_modules/
-frontend/dist/
 ui/node_modules/
 ui/dist/
 ui/dist-embed/

@@ -6,7 +6,7 @@ formatted answers (lists, tables, code), source chips, charts and a chat
 history sidebar. Light and dark mode; works on phones.
 
 It is a standalone Vite + React 18 + TypeScript app — it only talks to the
-backend over HTTP, and needs no code from `backend/` or `frontend/`.
+backend over HTTP, and needs no code from `backend/`.
 
 ## Prerequisites
 
