@@ -215,6 +215,7 @@ async def chat(
         grounded=result.grounded,
         chart=_to_chart_out(result.chart),
         live_sources=_to_live_sources_out(result.live_sources),
+        greeting=result.greeting,
     )
 
 
@@ -267,6 +268,7 @@ def _encode_sse_event(event: ChatStreamEvent) -> str:
             "live_sources": [
                 s.model_dump(mode="json") for s in _to_live_sources_out(event.live_sources)
             ],
+            "greeting": event.greeting,
         }
     elif isinstance(event, ChatStreamError):
         payload = {"type": "error", "detail": event.detail}

@@ -42,6 +42,8 @@ export interface ChatReply {
   grounded: boolean;
   chart?: Chart;
   liveSources: LiveSource[];
+  /** The fixed reply to a plain greeting: not an answer, so no source label. */
+  greeting: boolean;
 }
 
 export interface PostChatParams {
@@ -107,6 +109,7 @@ interface ChatResponseDto {
   grounded: boolean;
   chart?: ChartDto | null;
   live_sources?: LiveSourceDto[];
+  greeting?: boolean;
 }
 
 interface LiveSourceDto {
@@ -226,6 +229,7 @@ export async function postChat(
     grounded: data.grounded,
     chart: data.chart ? toChart(data.chart) : undefined,
     liveSources: toLiveSources(data.live_sources),
+    greeting: Boolean(data.greeting),
   };
 }
 
@@ -245,6 +249,7 @@ interface DoneEventDto {
   citations: CitationDto[];
   grounded: boolean;
   live_sources?: LiveSourceDto[];
+  greeting?: boolean;
 }
 
 interface ErrorEventDto {
@@ -277,6 +282,7 @@ function parseStreamEventDto(raw: unknown): StreamEventDto | undefined {
       citations: Array.isArray(done.citations) ? done.citations : [],
       grounded: Boolean(done.grounded),
       live_sources: Array.isArray(done.live_sources) ? done.live_sources : [],
+      greeting: Boolean(done.greeting),
     };
   }
   if (type === "error" && "detail" in raw && typeof (raw as ErrorEventDto).detail === "string") {
@@ -300,6 +306,7 @@ export interface PostChatStreamParams extends PostChatParams {
     citations: Citation[];
     grounded: boolean;
     liveSources: LiveSource[];
+    greeting: boolean;
   }) => void;
   onError: (detail: string) => void;
   /** Called instead of onError when the backend answers 401 (token
@@ -421,6 +428,7 @@ export async function postChatStream(
         citations: event.citations.map(toCitation),
         grounded: event.grounded,
         liveSources: toLiveSources(event.live_sources),
+        greeting: Boolean(event.greeting),
       });
     } else {
       sawDone = true;

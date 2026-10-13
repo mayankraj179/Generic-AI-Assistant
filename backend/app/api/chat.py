@@ -65,6 +65,9 @@ class ChatResponse(BaseModel):
     grounded: bool = False
     chart: ChartOut | None = None
     live_sources: list[LiveSourceOut] = Field(default_factory=list)
+    # True for the fixed reply to a plain greeting. Lets a client skip the
+    # "No document sources" label; older clients can ignore it.
+    greeting: bool = False
 
 
 class CreateSessionRequest(BaseModel):

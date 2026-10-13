@@ -11,6 +11,7 @@ export interface DisplayMessage {
   chart?: Chart;
   grounded?: boolean;
   liveSources?: LiveSource[];
+  greeting?: boolean;
   streaming?: boolean;
 }
 
@@ -122,7 +123,7 @@ export function Message({ message, assistantName }: { message: DisplayMessage; a
             )}
             {/* grounded=false also covers correct tool-only answers (e.g. a
                 calculation with nothing retrieved), so don't claim "not found". */}
-            {message.grounded === false && (
+            {message.grounded === false && !message.greeting && (
               <span className="badge-ungrounded">No document sources</span>
             )}
             <CopyButton text={message.content} />

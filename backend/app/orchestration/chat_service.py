@@ -35,6 +35,7 @@ from app.orchestration.errors import (
     InputGuardrailError,
     RetrievalUnavailableError,
 )
+from app.orchestration.greetings import greeting_reply, is_greeting
 from app.orchestration.model_provider import (
     ChartSpec,
     ConversationTurn,
@@ -172,6 +173,8 @@ class ChatResult:
     # Connectors whose live data backs this reply. Not citations: grounded
     # still means "backed by retrieved documents" only.
     live_sources: tuple[LiveSource, ...] = ()
+    # True for the fixed reply to a plain greeting (no retrieval, no model).
+    greeting: bool = False
 
 
 @dataclass(frozen=True)
@@ -198,6 +201,7 @@ class ChatStreamDone:
     citations: tuple[ChunkCitation, ...] = ()
     grounded: bool = False
     live_sources: tuple[LiveSource, ...] = ()
+    greeting: bool = False
 
 
 @dataclass(frozen=True)
@@ -345,6 +349,9 @@ class _PreparedTurn:
     prompt: GroundedPrompt | None
     chunks: tuple[Chunk, ...] = ()
     tool_result_fallback: str | None = None
+    # Set (and prompt None) when the message is a plain greeting: callers
+    # answer with this fixed text before anything else. See _answer_greeting.
+    greeting_reply: str | None = None
 
 
 @dataclass(frozen=True)
@@ -554,6 +561,12 @@ class ChatOrchestrator:
             conversation_id=conversation_id,
         )
 
+        if setup.greeting_reply is not None:
+            text = await self._answer_greeting(setup, principal=principal, message=message)
+            return ChatResult(
+                text=text, conversation_id=setup.conversation.id, grounded=False, greeting=True
+            )
+
         if setup.prompt is None:
             # No authorized/relevant/safe content was found — never fall
             # back to an ungrounded model call, and never widen the search.
@@ -735,6 +748,15 @@ class ChatOrchestrator:
                 message=message,
                 conversation_id=conversation_id,
             )
+
+        if setup.greeting_reply is not None:
+            # Same SSE contract as any turn: the text as a delta, then done.
+            text = await self._answer_greeting(setup, principal=principal, message=message)
+            yield ChatStreamDelta(text=text)
+            yield ChatStreamDone(
+                conversation_id=setup.conversation.id, citations=(), grounded=False, greeting=True
+            )
+            return
 
         if setup.prompt is None:
             recorder.outcome = "no_context"
@@ -945,6 +967,16 @@ class ChatOrchestrator:
         recorder = audit.current()
         if recorder is not None:
             recorder.conversation_id = conversation.id
+
+        # A plain greeting gets a fixed reply: no retrieval, no embedding, no
+        # model call. Checked after the input, clearance and conversation
+        # checks, so it is still a normal, owned, audited turn.
+        if config.greeting.enabled and is_greeting(message, display_name=config.display_name):
+            return _PreparedTurn(
+                conversation=conversation,
+                prompt=None,
+                greeting_reply=greeting_reply(config.display_name, config.greeting.message),
+            )
 
         prior_turns = tuple(
             ConversationTurn(role=m.role, content=m.content) for m in prior_messages
@@ -1243,6 +1275,29 @@ class ChatOrchestrator:
             return None
 
         return chart
+
+    async def _answer_greeting(
+        self, setup: _PreparedTurn, *, principal: PrincipalContext, message: str
+    ) -> str:
+        """Shared by handle() and handle_stream(). The reply is fixed text, so
+        it skips the output guardrails on purpose: there is nothing to rewrite
+        or downgrade, and it must read the same on every provider."""
+        assert setup.greeting_reply is not None
+        await self._persist_turn(
+            conversation_id=setup.conversation.id,
+            principal=principal,
+            user_message=message,
+            reply_text=setup.greeting_reply,
+            citations=(),
+        )
+        recorder = audit.current()
+        if recorder is not None:
+            recorder.outcome = "greeting"
+        logger.info(
+            "answered a greeting without retrieval or a model call",
+            extra={"event": "greeting"},
+        )
+        return setup.greeting_reply
 
     async def _persist_turn(
         self,

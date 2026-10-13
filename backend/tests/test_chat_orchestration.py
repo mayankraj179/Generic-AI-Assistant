@@ -398,10 +398,10 @@ async def test_non_rag_assistant_skips_retrieval_entirely():
     orchestrator = _make_orchestrator(retrieval=retrieval, provider=provider)
     config = _make_config(retrieval_enabled=False)
 
-    result = await orchestrator.handle(principal=_principal(), config=config, message="hello")
+    result = await orchestrator.handle(principal=_principal(), config=config, message="holidays?")
 
     assert retrieval.calls == []
-    assert provider.calls[0].user_message == "hello"
+    assert provider.calls[0].user_message == "holidays?"
     assert result.grounded is False
 
 
@@ -675,7 +675,7 @@ async def test_new_conversation_is_created_when_none_passed():
     )
 
     result = await orchestrator.handle(
-        principal=_principal(), config=_make_config(), message="hi", conversation_id=None
+        principal=_principal(), config=_make_config(), message="leave policy?", conversation_id=None
     )
 
     assert isinstance(result.conversation_id, uuid.UUID)
@@ -779,7 +779,10 @@ async def test_continuing_conversation_with_no_prior_turns_sends_empty_history()
     )
 
     await orchestrator.handle(
-        principal=principal, config=_make_config(), message="hi", conversation_id=conversation.id
+        principal=principal,
+        config=_make_config(),
+        message="leave policy?",
+        conversation_id=conversation.id,
     )
 
     assert provider.calls[0].prior_turns == ()
@@ -1093,7 +1096,9 @@ def test_unauthenticated_chat_is_rejected(provider: JwtAuthProvider):
         retrieval=FakeRetrievalService([_make_chunk()]), provider=FakeModelProvider()
     )
     client = TestClient(app)
-    response = client.post("/chat", json={"assistant_id": "hr_assistant", "message": "hi"})
+    response = client.post(
+        "/chat", json={"assistant_id": "hr_assistant", "message": "leave policy?"}
+    )
     assert response.status_code == 401
 
 
@@ -1102,7 +1107,9 @@ def test_principal_without_assistant_use_is_rejected():
         tenant_id="dev-tenant", principal_id="no-perms-user", labels=frozenset()
     )
     client = TestClient(app)
-    response = client.post("/chat", json={"assistant_id": "hr_assistant", "message": "hi"})
+    response = client.post(
+        "/chat", json={"assistant_id": "hr_assistant", "message": "leave policy?"}
+    )
     assert response.status_code == 403
 
 
@@ -1157,7 +1164,7 @@ def test_second_chat_call_continues_the_same_conversation(
     client = TestClient(app)
     first = client.post(
         "/chat",
-        json={"assistant_id": "hr_assistant", "message": "hi"},
+        json={"assistant_id": "hr_assistant", "message": "leave policy?"},
         headers={"Authorization": f"Bearer {token}"},
     )
     conversation_id = first.json()["conversation_id"]
@@ -1203,7 +1210,7 @@ async def test_chat_with_someone_elses_conversation_id_returns_404(
         "/chat",
         json={
             "assistant_id": "hr_assistant",
-            "message": "hi",
+            "message": "leave policy?",
             "conversation_id": str(other_conversation.id),
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -1230,7 +1237,7 @@ def test_client_cannot_override_security_context_via_request_body(
         "/chat",
         json={
             "assistant_id": "hr_assistant",
-            "message": "hi",
+            "message": "leave policy?",
             # Attempted spoofing — none of these are real ChatRequest fields.
             "tenant_id": "attacker-tenant",
             "principal_id": "attacker",
@@ -1262,7 +1269,7 @@ def test_unknown_assistant_id_returns_404(
     client = TestClient(app)
     response = client.post(
         "/chat",
-        json={"assistant_id": "does_not_exist", "message": "hi"},
+        json={"assistant_id": "does_not_exist", "message": "leave policy?"},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 404
@@ -1309,7 +1316,7 @@ def test_retrieval_failure_over_http_returns_503_without_leaking_details(
     client = TestClient(app)
     response = client.post(
         "/chat",
-        json={"assistant_id": "hr_assistant", "message": "hi"},
+        json={"assistant_id": "hr_assistant", "message": "leave policy?"},
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -1467,7 +1474,7 @@ def test_chat_stream_route_returns_sse_content_type_and_correct_event_framing(
     with client.stream(
         "POST",
         "/chat/stream",
-        json={"assistant_id": "hr_assistant", "message": "hi"},
+        json={"assistant_id": "hr_assistant", "message": "leave policy?"},
         headers={"Authorization": f"Bearer {token}"},
     ) as response:
         assert response.status_code == 200
@@ -1528,7 +1535,7 @@ def test_chat_stream_route_mid_stream_error_yields_error_event(
     with client.stream(
         "POST",
         "/chat/stream",
-        json={"assistant_id": "hr_assistant", "message": "hi"},
+        json={"assistant_id": "hr_assistant", "message": "leave policy?"},
         headers={"Authorization": f"Bearer {token}"},
     ) as response:
         assert response.status_code == 200  # headers already sent by this point
@@ -1541,7 +1548,9 @@ def test_chat_stream_route_mid_stream_error_yields_error_event(
 
 def test_chat_stream_route_requires_authentication():
     client = TestClient(app)
-    response = client.post("/chat/stream", json={"assistant_id": "hr_assistant", "message": "hi"})
+    response = client.post(
+        "/chat/stream", json={"assistant_id": "hr_assistant", "message": "leave policy?"}
+    )
     assert response.status_code == 401
 
 
@@ -1559,7 +1568,7 @@ def test_chat_stream_route_unknown_assistant_returns_404_not_a_stream(
     client = TestClient(app)
     response = client.post(
         "/chat/stream",
-        json={"assistant_id": "does_not_exist", "message": "hi"},
+        json={"assistant_id": "does_not_exist", "message": "leave policy?"},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 404

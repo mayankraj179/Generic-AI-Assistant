@@ -106,6 +106,18 @@ class GuardrailsConfig(BaseModel):
     unsafe_output_patterns: list[str] = Field(default_factory=list)
 
 
+class GreetingConfig(BaseModel):
+    """Plain greetings ("hi", "good morning") get a fixed reply with no
+    retrieval or model call (app/orchestration/greetings.py). On by default
+    for every assistant; a config may turn it off or change the wording.
+    ``message`` may contain ``{display_name}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    message: str | None = Field(default=None, min_length=1, max_length=500)
+
+
 class AssistantConfig(BaseModel):
     """The single source of truth for onboarding a new assistant use case.
 
@@ -142,6 +154,7 @@ class AssistantConfig(BaseModel):
     # read-only tools like these.
     max_tool_calls: int = Field(default=4, gt=0)
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
+    greeting: GreetingConfig = Field(default_factory=GreetingConfig)
 
     system_prompt: str
     min_clearance: int = 0
